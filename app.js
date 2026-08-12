@@ -715,13 +715,14 @@ function go(tab, push = true) {
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => go(b.dataset.tab));
 
 window.addEventListener('popstate', e => {
-  // Back out of a review discards the scan rather than the app. The back
-  // press already consumed an entry, so put one back or the next press
-  // closes the app from the Scan tab instead of returning to Collection.
+  // Back out of a review discards the scan rather than the app. Restore the
+  // entry the back press consumed first, before the confirm, so cancelling
+  // leaves history intact and the next press still returns to Collection.
   if (PENDING.length) {
+    history.pushState({ tab: 'scan' }, '', '#scan');
+    if (!confirm(`Discard the ${PENDING.length} cards you just scanned?`)) return;
     PENDING = [];
     TAB = 'scan';
-    history.pushState({ tab: 'scan' }, '', '#scan');
     render();
     return;
   }
