@@ -371,7 +371,7 @@ async function viewCollection(v) {
       <p class="font-display text-xl mb-2">Nothing logged yet</p>
       <p class="text-sm text-muted mb-6 max-w-xs mx-auto">Open a pack, take a photo, and every card lands here with its market price.</p>
       <button id="goScan" class="bg-maroon px-6 py-3 rounded font-display tracking-wide">Scan your first card</button>`));
-    $('#goScan').onclick = () => { TAB = 'scan'; render(); };
+    $('#goScan').onclick = () => go('scan');
     return;
   }
 
@@ -553,8 +553,7 @@ function viewReview(v) {
     }
     toast(`${PENDING.length} added`);
     PENDING = [];
-    TAB = 'collection';
-    render();
+    go('collection');
   };
   cancel.onclick = () => { PENDING = []; render(); };
   actions.append(save, cancel);
@@ -659,8 +658,18 @@ function viewSettings(v) {
 
       <div class="serrate serrate-thin"></div>
 
+      ${installPrompt ? `<button id="s-install" class="w-full bg-maroonD py-3 rounded font-display tracking-wide">Install to home screen</button>` : ''}
+
       <button id="s-export" class="w-full border border-muted/30 text-muted py-3 rounded text-sm">Export collection as CSV</button>
     </div>`;
+
+  const install = $('#s-install');
+  if (install) install.onclick = async () => {
+    installPrompt.prompt();
+    await installPrompt.userChoice;
+    installPrompt = null;
+    render();
+  };
 
   $('#s-save').onclick = () => {
     CFG.workerUrl = $('#s-url').value.trim();
@@ -691,13 +700,50 @@ function viewSettings(v) {
 
 /* ------------------------------------------------------------------ boot */
 
-document.querySelectorAll('.tab').forEach(b => b.onclick = () => {
-  if (TAB === 'scan' && PENDING.length && b.dataset.tab !== 'scan') {
+/* Android's hardware back button walks history. Without entries it would
+   close the app from any tab, so every tab change pushes one. */
+function go(tab, push = true) {
+  if (TAB === 'scan' && PENDING.length && tab !== 'scan') {
     if (!confirm('Leave without saving the scanned cards?')) return;
     PENDING = [];
   }
-  TAB = b.dataset.tab;
+  TAB = tab;
+  if (push) history.pushState({ tab }, '', '#' + tab);
   render();
+}
+
+document.querySelectorAll('.tab').forEach(b => b.onclick = () => go(b.dataset.tab));
+
+window.addEventListener('popstate', e => {
+  // Back out of a review discards the scan rather than the app. The back
+  // press already consumed an entry, so put one back or the next press
+  // closes the app from the Scan tab instead of returning to Collection.
+  if (PENDING.length) {
+    PENDING = [];
+    TAB = 'scan';
+    history.pushState({ tab: 'scan' }, '', '#scan');
+    render();
+    return;
+  }
+  TAB = e.state?.tab || 'collection';
+  render();
+});
+
+history.replaceState({ tab: 'collection' }, '', '#collection');
+
+/* Chrome grants this readily to installed PWAs. Once granted the collection
+   survives storage pressure and only clearing site data removes it. */
+if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
+
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  installPrompt = e;
+  if (TAB === 'settings') render();
+});
+window.addEventListener('appinstalled', () => {
+  installPrompt = null;
+  if (TAB === 'settings') render();
 });
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
