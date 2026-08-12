@@ -16,6 +16,11 @@ const saveCfg = () => localStorage.setItem('cfg', JSON.stringify(CFG));
 
 const CONDITIONS = ['NM', 'LP', 'MP', 'HP', 'DMG'];
 
+/* Rough TCGplayer convention, not gospel. Adjust once you see what condition
+   actually costs in Doha. */
+const COND_MULT = { NM: 1, LP: 0.85, MP: 0.7, HP: 0.5, DMG: 0.3 };
+const valueOf = c => (c.priceUsd || 0) * (COND_MULT[c.condition] ?? 1);
+
 /* ------------------------------------------------------------------- db */
 
 const DB = (() => {
@@ -351,7 +356,7 @@ async function render() {
 
 async function updateTotals() {
   const cards = await DB.all();
-  const total = cards.reduce((s, c) => s + (c.priceUsd || 0) * (c.qty || 1), 0);
+  const total = cards.reduce((s, c) => s + valueOf(c) * (c.qty || 1), 0);
   $('#totalValue').textContent = qar(total);
   $('#totalUsd').textContent = usd(total);
 }
@@ -391,8 +396,8 @@ function cardTile(c) {
     <div class="p-2.5">
       <p class="font-display text-sm leading-tight truncate">${esc(c.name)}</p>
       <p class="text-[11px] text-muted truncate">${esc(c.setName)} ${c.number ? esc(c.number) : ''}${c.printedTotal ? '/' + esc(c.printedTotal) : ''}</p>
-      <p class="text-gold font-display text-base tabular mt-1.5">${qar(c.priceUsd)}</p>
-      <p class="text-[10px] text-muted tabular">${usd(c.priceUsd)} · ${esc(c.condition || 'NM')}${c.qty > 1 ? ' · x' + c.qty : ''}</p>
+      <p class="text-gold font-display text-base tabular mt-1.5">${qar(valueOf(c))}</p>
+      <p class="text-[10px] text-muted tabular">${usd(valueOf(c))} · ${esc(c.condition || 'NM')}${c.qty > 1 ? ' · x' + c.qty : ''}</p>
       <div class="flex gap-1.5 mt-2">
         <button class="trade flex-1 text-[10px] uppercase tracking-[0.1em] py-1.5 rounded border ${c.forTrade ? 'bg-maroon border-maroon' : 'border-muted/30 text-muted'}">${c.forTrade ? 'For trade' : 'Keep'}</button>
         <button class="del text-[10px] px-2 py-1.5 rounded border border-muted/30 text-muted">✕</button>
@@ -503,7 +508,7 @@ async function runScan(file, isBulk) {
 /* ---- review ---- */
 
 function viewReview(v) {
-  const total = PENDING.reduce((s, c) => s + (c.priceUsd || 0), 0);
+  const total = PENDING.reduce((s, c) => s + valueOf(c), 0);
 
   const head = el('div', 'mb-4 fade-up');
   head.innerHTML = `
@@ -523,13 +528,13 @@ function viewReview(v) {
         ${low ? `<p class="text-[11px] text-gold mt-0.5">${c.matched ? 'Low confidence, worth a look' : 'No catalog match'}</p>` : ''}
         <div class="flex items-center gap-2 mt-2">
           <select class="cond bg-ink text-xs rounded px-2 py-1 border border-muted/30">
-            ${CONDITIONS.map(k => `<option ${k === 'NM' ? 'selected' : ''}>${k}</option>`).join('')}
+            ${CONDITIONS.map(k => `<option ${k === (c.condition || 'NM') ? 'selected' : ''}>${k}</option>`).join('')}
           </select>
-          <span class="text-gold text-sm font-display tabular">${qar(c.priceUsd)}</span>
+          <span class="text-gold text-sm font-display tabular">${qar(valueOf(c))}</span>
           <button class="drop ml-auto text-xs text-muted px-2">Remove</button>
         </div>
       </div>`;
-    row.querySelector('.cond').onchange = e => PENDING[i].condition = e.target.value;
+    row.querySelector('.cond').onchange = e => { PENDING[i].condition = e.target.value; render(); };
     row.querySelector('.drop').onclick = () => { PENDING.splice(i, 1); render(); };
     v.appendChild(row);
   });
@@ -559,7 +564,7 @@ function viewReview(v) {
 /* ---- trade ---- */
 
 function askPrice(c) {
-  return (c.priceUsd || 0) * CFG.qarRate * (1 + (Number(CFG.premium) || 0) / 100);
+  return valueOf(c) * CFG.qarRate * (1 + (Number(CFG.premium) || 0) / 100);
 }
 
 async function viewTrade(v) {
