@@ -21,6 +21,16 @@ const CONDITIONS = ['NM', 'LP', 'MP', 'HP', 'DMG'];
 const COND_MULT = { NM: 1, LP: 0.85, MP: 0.7, HP: 0.5, DMG: 0.3 };
 const valueOf = c => (c.priceUsd || 0) * (COND_MULT[c.condition] ?? 1);
 
+/* Copies of one printing in one condition share a row. Keyed on the catalog
+   id, not the name, because two cards can share a name; variant and condition
+   are priced differently so they stay separate rows. printing is derived from
+   variant, so it adds nothing to the key. */
+const stackKey = c => [c.cardId, c.variant || 'normal', c.condition || 'NM'].join('|');
+
+/* How many copies of a row are on the trade shelf. Falls back to the old
+   forTrade boolean so rows written before stacking still read correctly. */
+const tradeOf = c => c.tradeQty ?? (c.forTrade ? (c.qty || 1) : 0);
+
 /* ------------------------------------------------------------------- db */
 
 const DB = (() => {
@@ -388,6 +398,8 @@ async function viewCollection(v) {
 }
 
 function cardTile(c) {
+  const qty = c.qty || 1;
+  const tq = tradeOf(c);
   const t = el('div', 'bg-ink2 rounded overflow-hidden fade-up');
   t.innerHTML = `
     <div class="card-ratio bg-maroonD/40">
@@ -399,13 +411,35 @@ function cardTile(c) {
       <p class="text-gold font-display text-base tabular mt-1.5">${qar(valueOf(c))}</p>
       <p class="text-[10px] text-muted tabular">${usd(valueOf(c))} · ${esc(c.condition || 'NM')}${c.qty > 1 ? ' · x' + c.qty : ''}</p>
       <div class="flex gap-1.5 mt-2">
-        <button class="trade flex-1 text-[10px] uppercase tracking-[0.1em] py-1.5 rounded border ${c.forTrade ? 'bg-maroon border-maroon' : 'border-muted/30 text-muted'}">${c.forTrade ? 'For trade' : 'Keep'}</button>
+        ${qty > 1 ? `
+          <button class="tminus w-7 text-sm leading-none py-1.5 rounded border ${tq ? 'border-maroon' : 'border-muted/30 text-muted'}">−</button>
+          <span class="flex-1 text-[10px] uppercase tracking-[0.1em] py-1.5 text-center tabular ${tq ? 'text-gold' : 'text-muted'}">${tq ? tq + '/' + qty + ' trade' : 'Keep all'}</span>
+          <button class="tplus w-7 text-sm leading-none py-1.5 rounded border ${tq < qty ? 'border-maroon' : 'border-muted/30 text-muted'}">+</button>
+        ` : `
+          <button class="trade flex-1 text-[10px] uppercase tracking-[0.1em] py-1.5 rounded border ${tq ? 'bg-maroon border-maroon' : 'border-muted/30 text-muted'}">${tq ? 'For trade' : 'Keep'}</button>
+        `}
         <button class="del text-[10px] px-2 py-1.5 rounded border border-muted/30 text-muted">✕</button>
       </div>
     </div>`;
-  t.querySelector('.trade').onclick = async () => { c.forTrade = !c.forTrade; await DB.put(c); render(); };
-  t.querySelector('.del').onclick = async () => {
-    if (confirm(`Remove ${c.name} from the collection?`)) { await DB.del(c.id); render(); }
+
+  const setTrade = async n => {
+    c.tradeQty = Math.max(0, Math.min(qty, n));
+    delete c.forTrade;             // superseded by tradeQty
+    await DB.put(c);
+    render();
+  };
+  const q = s => t.querySelector(s);
+  if (qty > 1) {
+    q('.tminus').onclick = () => setTrade(tq - 1);
+    q('.tplus').onclick = () => setTrade(tq + 1);
+  } else {
+    q('.trade').onclick = () => setTrade(tq ? 0 : 1);
+  }
+  q('.del').onclick = async () => {
+    const msg = qty > 1
+      ? `Remove all ${qty} copies of ${c.name}?`
+      : `Remove ${c.name} from the collection?`;
+    if (confirm(msg)) { await DB.del(c.id); render(); }
   };
   return t;
 }
@@ -543,15 +577,35 @@ function viewReview(v) {
   const save = el('button', 'flex-1 bg-maroon py-3 rounded font-display tracking-wide', 'Add to collection');
   const cancel = el('button', 'px-5 py-3 rounded border border-muted/30 text-muted text-sm', 'Discard');
   save.onclick = async () => {
+    const rows = await DB.all();
+    const byKey = new Map(rows.filter(r => r.cardId).map(r => [stackKey(r), r]));
+    let stacked = 0;
+
     for (const c of PENDING) {
-      await DB.put({
+      const rec = {
         cardId: c.cardId, name: c.name, setName: c.setName, number: c.number,
         printedTotal: c.printedTotal, image: c.image, variant: c.variant,
         printing: c.printing, priceUsd: c.priceUsd, condition: c.condition || 'NM',
-        qty: 1, forTrade: false, addedAt: Date.now(), priceUpdated: Date.now()
-      });
+        qty: 1, tradeQty: 0, addedAt: Date.now(), priceUpdated: Date.now()
+      };
+      // No catalog id means the card was never identified, so copies of it
+      // can't be told apart. Those stay separate rows rather than risk
+      // merging two different unknown cards into one stack.
+      const hit = c.cardId ? byKey.get(stackKey(rec)) : null;
+      if (hit) {
+        hit.qty = (hit.qty || 1) + 1;
+        hit.priceUsd = rec.priceUsd || hit.priceUsd;
+        hit.priceUpdated = Date.now();
+        await DB.put(hit);
+        stacked++;
+      } else {
+        rec.id = await DB.put(rec);
+        // Seed the map so later copies in this same batch stack onto it.
+        if (c.cardId) byKey.set(stackKey(rec), rec);
+      }
     }
-    toast(`${PENDING.length} added`);
+
+    toast(stacked ? `${PENDING.length} added, ${stacked} stacked` : `${PENDING.length} added`);
     PENDING = [];
     go('collection');
   };
@@ -567,7 +621,8 @@ function askPrice(c) {
 }
 
 async function viewTrade(v) {
-  const cards = (await DB.all()).filter(c => c.forTrade).sort((a, b) => b.priceUsd - a.priceUsd);
+  const cards = (await DB.all()).filter(c => tradeOf(c) > 0).sort((a, b) => b.priceUsd - a.priceUsd);
+  const copies = cards.reduce((s, c) => s + tradeOf(c), 0);
 
   if (!cards.length) {
     v.innerHTML = `<div class="text-center py-20 fade-up">
@@ -576,20 +631,23 @@ async function viewTrade(v) {
     return;
   }
 
-  const total = cards.reduce((s, c) => s + askPrice(c), 0);
+  const total = cards.reduce((s, c) => s + askPrice(c) * tradeOf(c), 0);
   const head = el('div', 'mb-4 fade-up');
   head.innerHTML = `
-    <p class="font-display text-xl">${cards.length} on the shelf</p>
+    <p class="font-display text-xl">${copies} on the shelf${copies !== cards.length ? ` · ${cards.length} listing${cards.length === 1 ? '' : 's'}` : ''}</p>
     <p class="text-gold font-display text-2xl tabular">${Math.round(total).toLocaleString()} QAR</p>
     <p class="text-xs text-muted">Asks include your ${CFG.premium || 0}% local premium.</p>`;
   v.appendChild(head);
 
   const post = el('button', 'w-full bg-maroon py-3 rounded font-display tracking-wide mb-5', 'Copy list for WhatsApp');
   post.onclick = async () => {
-    const lines = cards.map(c =>
-      `${c.name} ${c.number}${c.printedTotal ? '/' + c.printedTotal : ''}` +
-      `${c.variant === 'reverse' ? ' (RH)' : c.variant === 'holo' ? ' (Holo)' : ''}` +
-      ` [${c.condition || 'NM'}] - ${Math.round(askPrice(c)).toLocaleString()} QAR`);
+    const lines = cards.map(c => {
+      const n = tradeOf(c);
+      return `${c.name} ${c.number}${c.printedTotal ? '/' + c.printedTotal : ''}` +
+        `${c.variant === 'reverse' ? ' (RH)' : c.variant === 'holo' ? ' (Holo)' : ''}` +
+        ` [${c.condition || 'NM'}]${n > 1 ? ` x${n}` : ''}` +
+        ` - ${Math.round(askPrice(c)).toLocaleString()} QAR${n > 1 ? ' each' : ''}`;
+    });
     const text = `FOR TRADE / SALE - Doha\n\n${lines.join('\n')}\n\nPrices track TCGplayer market. Open to trades.`;
     try {
       await navigator.clipboard.writeText(text);
@@ -606,11 +664,11 @@ async function viewTrade(v) {
       <img src="${esc(c.image)}" class="w-11 rounded object-cover card-ratio" alt="">
       <div class="flex-1 min-w-0">
         <p class="font-display text-sm truncate">${esc(c.name)}</p>
-        <p class="text-[11px] text-muted truncate">${esc(c.setName)} · ${esc(c.condition || 'NM')}</p>
+        <p class="text-[11px] text-muted truncate">${esc(c.setName)} · ${esc(c.condition || 'NM')}${tradeOf(c) > 1 ? ' · x' + tradeOf(c) : ''}</p>
       </div>
       <div class="text-right">
         <p class="text-gold font-display tabular">${Math.round(askPrice(c)).toLocaleString()}</p>
-        <p class="text-[10px] text-muted">QAR</p>
+        <p class="text-[10px] text-muted">QAR${tradeOf(c) > 1 ? ' ea' : ''}</p>
       </div>`;
     v.appendChild(row);
   });
@@ -684,10 +742,10 @@ function viewSettings(v) {
 
   $('#s-export').onclick = async () => {
     const cards = await DB.all();
-    const head = ['name', 'set', 'number', 'printedTotal', 'variant', 'condition', 'qty', 'priceUsd', 'priceQar', 'forTrade'];
+    const head = ['name', 'set', 'number', 'printedTotal', 'variant', 'condition', 'qty', 'priceUsd', 'priceQar', 'tradeQty'];
     const rows = cards.map(c => [
-      c.name, c.setName, c.number, c.printedTotal, c.variant, c.condition, c.qty,
-      (c.priceUsd || 0).toFixed(2), Math.round((c.priceUsd || 0) * CFG.qarRate), c.forTrade ? 'yes' : 'no'
+      c.name, c.setName, c.number, c.printedTotal, c.variant, c.condition, c.qty || 1,
+      (c.priceUsd || 0).toFixed(2), Math.round((c.priceUsd || 0) * CFG.qarRate), tradeOf(c)
     ].map(x => `"${String(x ?? '').replace(/"/g, '""')}"`).join(','));
     const blob = new Blob([[head.join(','), ...rows].join('\n')], { type: 'text/csv' });
     const a = el('a');
@@ -702,9 +760,12 @@ function viewSettings(v) {
 
 /* Android's hardware back button walks history. Without entries it would
    close the app from any tab, so every tab change pushes one. */
+const discardPrompt = () =>
+  `Discard the ${PENDING.length} card${PENDING.length === 1 ? '' : 's'} you just scanned?`;
+
 function go(tab, push = true) {
   if (TAB === 'scan' && PENDING.length && tab !== 'scan') {
-    if (!confirm('Leave without saving the scanned cards?')) return;
+    if (!confirm(discardPrompt())) return;
     PENDING = [];
   }
   TAB = tab;
@@ -720,7 +781,7 @@ window.addEventListener('popstate', e => {
   // leaves history intact and the next press still returns to Collection.
   if (PENDING.length) {
     history.pushState({ tab: 'scan' }, '', '#scan');
-    if (!confirm(`Discard the ${PENDING.length} cards you just scanned?`)) return;
+    if (!confirm(discardPrompt())) return;
     PENDING = [];
     TAB = 'scan';
     render();
