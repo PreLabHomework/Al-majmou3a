@@ -1,0 +1,10 @@
+# Claude Code local settings
+.claude/
+
+# Never commit the Worker's secrets
+.dev.vars
+.env
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1A0D12">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Al Majmoua</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Reem+Kufi:wght@400;600;700&family=Cairo:wght@300;400;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        ink:     '#1A0D12',
+        ink2:    '#241017',
+        maroon:  '#8A1538',
+        maroonD: '#5C0E25',
+        bone:    '#F7F3EE',
+        sand:    '#D9C7A7',
+        gold:    '#C9A227',
+        muted:   '#8B7A78'
+      },
+      fontFamily: {
+        display: ['"Reem Kufi"', 'sans-serif'],
+        body:    ['Cairo', 'sans-serif']
+      }
+    }
+  }
+}
+</script>
+<style>
+  html, body { background: #1A0D12; color: #F7F3EE; font-family: Cairo, sans-serif; overscroll-behavior-y: none; }
+  * { -webkit-tap-highlight-color: transparent; }
+
+  /* Signature: the nine-point serrated edge from the flag. */
+  .serrate {
+    height: 14px;
+    background: #8A1538;
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 90 14' preserveAspectRatio='none'%3E%3Cpath d='M0 0h90v7L85 14 80 7 75 14 70 7 65 14 60 7 55 14 50 7 45 14 40 7 35 14 30 7 25 14 20 7 15 14 10 7 5 14 0 7Z' fill='%23fff'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 90 14' preserveAspectRatio='none'%3E%3Cpath d='M0 0h90v7L85 14 80 7 75 14 70 7 65 14 60 7 55 14 50 7 45 14 40 7 35 14 30 7 25 14 20 7 15 14 10 7 5 14 0 7Z' fill='%23fff'/%3E%3C/svg%3E");
+    -webkit-mask-size: 100% 100%;
+    mask-size: 100% 100%;
+  }
+  .serrate-thin { height: 8px; opacity: .5; }
+
+  .card-ratio { aspect-ratio: 63 / 88; }
+  .tabular { font-variant-numeric: tabular-nums; }
+  .fade-up { animation: fadeUp .32s cubic-bezier(.2,.7,.3,1) both; }
+  @keyframes fadeUp { from { opacity:0; transform: translateY(10px) } to { opacity:1; transform:none } }
+  .shutter { position:fixed; inset:0; background:#F7F3EE; opacity:0; pointer-events:none; z-index:80; }
+  .shutter.fire { animation: flash .28s ease-out; }
+  @keyframes flash { 0%{opacity:.85} 100%{opacity:0} }
+  @media (prefers-reduced-motion: reduce) {
+    .fade-up, .shutter.fire { animation: none; }
+  }
+  :focus-visible { outline: 2px solid #C9A227; outline-offset: 2px; }
+  .safe-b { padding-bottom: calc(env(safe-area-inset-bottom) + 0.5rem); }
+</style>
+</head>
+<body class="font-body">
+
+<div class="shutter" id="shutter"></div>
+
+<!-- Header -->
+<header class="sticky top-0 z-40 bg-ink/95 backdrop-blur">
+  <div class="flex items-end justify-between px-4 pt-4 pb-3">
+    <div>
+      <h1 class="font-display text-2xl leading-none tracking-wide">المجموعة</h1>
+      <p class="text-[11px] uppercase tracking-[0.2em] text-muted mt-1">Al Majmoua</p>
+    </div>
+    <div class="text-right">
+      <p class="text-[10px] uppercase tracking-[0.18em] text-muted">Collection value</p>
+      <p id="totalValue" class="font-display text-xl text-gold tabular leading-tight">0 QAR</p>
+      <p id="totalUsd" class="text-[11px] text-muted tabular">$0.00</p>
+    </div>
+  </div>
+  <div class="serrate"></div>
+</header>
+
+<main id="view" class="px-4 pt-5 pb-32 min-h-[70vh]"></main>
+
+<!-- Bottom nav -->
+<nav class="fixed bottom-0 inset-x-0 z-40 bg-ink2 border-t border-maroonD safe-b">
+  <div class="grid grid-cols-4">
+    <button data-tab="collection" class="tab py-3 flex flex-col items-center gap-1">
+      <span class="text-lg">▦</span><span class="text-[10px] uppercase tracking-[0.14em]">Collection</span>
+    </button>
+    <button data-tab="scan" class="tab py-3 flex flex-col items-center gap-1">
+      <span class="text-lg">◎</span><span class="text-[10px] uppercase tracking-[0.14em]">Scan</span>
+    </button>
+    <button data-tab="trade" class="tab py-3 flex flex-col items-center gap-1">
+      <span class="text-lg">⇄</span><span class="text-[10px] uppercase tracking-[0.14em]">Trade</span>
+    </button>
+    <button data-tab="settings" class="tab py-3 flex flex-col items-center gap-1">
+      <span class="text-lg">⚙</span><span class="text-[10px] uppercase tracking-[0.14em]">Settings</span>
+    </button>
+  </div>
+</nav>
+
+<script src="app.js"></script>
+</body>
+</html>
