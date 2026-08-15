@@ -29,12 +29,18 @@ const valueOf = c => {
 };
 
 /* Copies of one printing in one condition share a row. Keyed on the catalog
-   id, not the name, because two cards can share a name; variant, condition
-   and grade are priced differently so they stay separate rows. Sealed has no
-   catalog id at all, so it keys on product name plus set. */
-const stackKey = c => c.kind === 'sealed'
-  ? ['sealed', c.name, c.setName].join('|')
-  : [c.cardId, c.variant || 'normal', c.condition || 'NM', c.grade || ''].join('|');
+   id where we have one. Sealed has no id at all, so it keys on product name
+   plus set. A row with no id but a real name and number still has a
+   trustworthy identity, which is what lets an unmatched import row stack
+   instead of duplicating on every re-import. A failed scan has no number, so
+   it returns null and always stays its own row. */
+const stackKey = c => {
+  if (c.kind === 'sealed') return ['sealed', c.name, c.setName].join('|');
+  const tail = [c.variant || 'normal', c.condition || 'NM', c.grade || ''].join('|');
+  if (c.cardId) return ['id', c.cardId, tail].join('|');
+  if (c.name && c.number) return ['raw', c.name, c.setName, c.number, tail].join('|');
+  return null;
+};
 
 /* How many copies of a row are on the trade shelf. Falls back to the old
    forTrade boolean so rows written before stacking still read correctly. */
@@ -73,6 +79,7 @@ const DB = (() => {
     all:    async ()   => wrap((await tx('cards', 'readonly')).getAll()),
     put:    async (c)  => wrap((await tx('cards', 'readwrite')).put(c)),
     del:    async (id) => wrap((await tx('cards', 'readwrite')).delete(id)),
+    clear:  async ()   => wrap((await tx('cards', 'readwrite')).clear()),
     cacheGet: async (k) => wrap((await tx('catalog', 'readonly')).get(k)),
     cacheSet: async (k, v) => wrap((await tx('catalog', 'readwrite')).put({ key: k, value: v, at: Date.now() }))
   };
@@ -365,6 +372,7 @@ async function processCrops(canvases, statusEl) {
         setName: card?.set?.name || read.setHint || '',
         number: card?.number || read.number || '',
         printedTotal: card?.set?.printedTotal || read.printedTotal || '',
+        rarity: card?.rarity || '',
         image: card?.images?.small || c.toDataURL('image/jpeg', 0.6),
         variant: read.variant || 'normal',
         printing: price?.printing || '',
@@ -503,38 +511,46 @@ function readCollectr(text) {
   return { kept, skipped };
 }
 
-/* Resolve raw singles against the catalog for artwork, a stable id, and a
-   live price. Sealed and graded rows pass straight through untouched. */
+/* Resolve every single against the catalog for artwork and a stable id.
+   Graded rows are included so they get an id and can stack, but their price
+   is left alone: a graded figure is not a raw market price. Sealed passes
+   through untouched, since the catalog holds no sealed product. */
 async function enrichImport(rows, onProgress) {
-  const targets = rows.filter(r => r.kind === 'single' && !r.grade);
-  let done = 0;
+  const targets = rows.filter(r => r.kind === 'single');
+  let done = 0, matched = 0;
   for (const r of targets) {
     try {
       const card = await resolve(r);
       if (card) {
+        matched++;
         r.cardId = card.id;
         r.name = card.name || r.name;
         r.setName = card.set?.name || r.setName;
         r.number = card.number || r.number;
         r.printedTotal = card.set?.printedTotal || r.printedTotal;
         r.image = card.images?.small || '';
-        const p = priceOf(card, r.variant);
-        if (p) { r.priceUsd = p.usd; r.printing = p.printing; r.priceUpdated = Date.now(); }
+        r.rarity = card.rarity || r.rarity;
+        if (!r.grade) {
+          const p = priceOf(card, r.variant);
+          if (p) { r.priceUsd = p.usd; r.printing = p.printing; r.priceUpdated = Date.now(); }
+        }
       }
     } catch { /* leave the Collectr figure in place rather than blanking it */ }
     onProgress(++done, targets.length);
   }
-  return rows;
+  return matched;
 }
 
 /* Merge rows into the collection, stacking onto anything that matches. */
 async function commitRows(rows) {
   const existing = await DB.all();
-  const byKey = new Map(existing.map(r => [stackKey(r), r]));
+  const byKey = new Map();
+  for (const r of existing) { const k = stackKey(r); if (k) byKey.set(k, r); }
   let added = 0, stacked = 0;
 
   for (const r of rows) {
-    const hit = (r.kind === 'sealed' || r.cardId) ? byKey.get(stackKey(r)) : null;
+    const key = stackKey(r);
+    const hit = key ? byKey.get(key) : null;
     if (hit) {
       hit.qty = (hit.qty || 1) + (r.qty || 1);
       if (r.priceUsd) { hit.priceUsd = r.priceUsd; hit.priceUpdated = Date.now(); }
@@ -544,7 +560,8 @@ async function commitRows(rows) {
       const rec = { ...r };
       delete rec.matched; delete rec.confidence; delete rec.error;
       rec.id = await DB.put(rec);
-      if (r.kind === 'sealed' || r.cardId) byKey.set(stackKey(rec), rec);
+      const k = stackKey(rec);
+      if (k) byKey.set(k, rec);
       added++;
     }
   }
@@ -556,7 +573,7 @@ async function commitRows(rows) {
 let TAB = 'collection';
 let PENDING = [];
 let IMPORT = null;
-let FILTER = { q: '', kind: 'all', sort: 'updated' };
+let FILTER = { q: '', kind: 'all', sort: 'updated', set: '', rarity: '', view: 'grid' };
 
 async function render() {
   const v = $('#view');
@@ -587,8 +604,12 @@ function applyFilter(cards) {
     if (FILTER.kind === 'singles' && c.kind === 'sealed') return false;
     if (FILTER.kind === 'sealed' && c.kind !== 'sealed') return false;
     if (FILTER.kind === 'trade' && tradeOf(c) < 1) return false;
+    if (FILTER.set && (c.setName || '') !== FILTER.set) return false;
+    if (FILTER.rarity && (c.rarity || '') !== FILTER.rarity) return false;
     if (!q) return true;
-    return (c.name + ' ' + (c.setName || '') + ' ' + (c.number || '')).toLowerCase().includes(q);
+    const hay = [c.name, c.setName, c.number, c.printedTotal, c.rarity,
+                 c.grade, c.variant, c.era].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(q);
   });
   const sorts = {
     updated: (a, b) => (b.priceUpdated || b.addedAt || 0) - (a.priceUpdated || a.addedAt || 0),
@@ -611,29 +632,50 @@ async function viewCollection(v) {
     return;
   }
 
+  // Filter options come from what he actually owns, so no empty choices.
+  const sets = [...new Set(cards.map(c => c.setName).filter(Boolean))].sort();
+  const rarities = [...new Set(cards.map(c => c.rarity).filter(Boolean))].sort();
   const KINDS = [['all', 'All'], ['singles', 'Singles'], ['sealed', 'Sealed'], ['trade', 'Trade']];
-  const controls = el('div', 'mb-4 fade-up');
+
+  const controls = el('div', 'mb-3 fade-up');
   controls.innerHTML = `
-    <input id="q" value="${esc(FILTER.q)}" placeholder="Search name, set or number" enterkeyhint="search"
-      class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm mb-2.5">
+    <div class="flex gap-2 mb-2.5">
+      <input id="q" value="${esc(FILTER.q)}" placeholder="Name, number, rarity, grade" enterkeyhint="search"
+        class="flex-1 min-w-0 bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm">
+      <button id="view" class="shrink-0 w-11 rounded border border-muted/30 text-muted text-lg leading-none"
+        aria-label="Switch layout">${FILTER.view === 'grid' ? 'â¤' : 'â¦'}</button>
+    </div>
+
     <div class="flex gap-1.5 mb-2.5">
       ${KINDS.map(([k, label]) => `<button data-kind="${k}"
         class="kind flex-1 text-[10px] uppercase tracking-[0.1em] py-1.5 rounded border ${FILTER.kind === k ? 'bg-maroon border-maroon' : 'border-muted/30 text-muted'}">${label}</button>`).join('')}
     </div>
+
+    <div class="grid grid-cols-2 gap-2 mb-2.5">
+      <select id="fset" class="bg-ink2 text-xs rounded px-2 py-1.5 border border-muted/30 min-w-0">
+        <option value="">All sets</option>
+        ${sets.map(x => `<option value="${esc(x)}"${FILTER.set === x ? ' selected' : ''}>${esc(x)}</option>`).join('')}
+      </select>
+      <select id="frar" class="bg-ink2 text-xs rounded px-2 py-1.5 border border-muted/30 min-w-0">
+        <option value="">All rarities</option>
+        ${rarities.map(x => `<option value="${esc(x)}"${FILTER.rarity === x ? ' selected' : ''}>${esc(x)}</option>`).join('')}
+      </select>
+    </div>
+
     <div class="flex items-center gap-2">
-      <select id="sort" class="bg-ink2 text-xs rounded px-2 py-1.5 border border-muted/30 flex-1">
+      <select id="sort" class="bg-ink2 text-xs rounded px-2 py-1.5 border border-muted/30 flex-1 min-w-0">
         <option value="updated"${FILTER.sort === 'updated' ? ' selected' : ''}>Recently updated</option>
         <option value="added"${FILTER.sort === 'added' ? ' selected' : ''}>Recently added</option>
         <option value="value"${FILTER.sort === 'value' ? ' selected' : ''}>Highest value</option>
         <option value="name"${FILTER.sort === 'name' ? ' selected' : ''}>Name</option>
       </select>
-      <button id="refresh" class="text-xs uppercase tracking-[0.14em] text-gold border border-gold/40 px-3 py-1.5 rounded">Refresh prices</button>
+      <button id="refresh" class="shrink-0 text-xs uppercase tracking-[0.14em] text-gold border border-gold/40 px-3 py-1.5 rounded">Refresh</button>
     </div>`;
   v.appendChild(controls);
 
-  const count = el('p', 'text-sm text-muted mb-3');
-  const grid = el('div', 'grid grid-cols-2 gap-3');
-  v.append(count, grid);
+  const count = el('p', 'text-sm text-muted my-3');
+  const list = el('div');
+  v.append(count, list);
 
   const paint = () => {
     const shown = applyFilter(cards);
@@ -642,84 +684,107 @@ async function viewCollection(v) {
     count.textContent = shown.length
       ? `${copies} item${copies === 1 ? '' : 's'} Â· ${qar(worth)}`
       : 'Nothing matches that.';
-    grid.innerHTML = '';
-    shown.forEach(c => grid.appendChild(cardTile(c)));
+    list.className = FILTER.view === 'grid' ? 'grid grid-cols-3 gap-2' : '';
+    list.innerHTML = '';
+    shown.forEach(c => list.appendChild(FILTER.view === 'grid' ? gridTile(c) : listRow(c)));
   };
   paint();
 
-  // Only the grid repaints on a keystroke, so the input keeps focus and the
+  // Only the list repaints on a keystroke, so the input keeps focus and the
   // caret does not jump.
   let debounce;
-  const input = $('#q', controls);
-  input.oninput = e => {
+  $('#q', controls).oninput = e => {
     FILTER.q = e.target.value;
     clearTimeout(debounce);
     debounce = setTimeout(paint, 200);
   };
   $('#sort', controls).onchange = e => { FILTER.sort = e.target.value; paint(); };
-  controls.querySelectorAll('.kind').forEach(b => b.onclick = () => {
-    FILTER.kind = b.dataset.kind;
-    render();
-  });
+  $('#fset', controls).onchange = e => { FILTER.set = e.target.value; paint(); };
+  $('#frar', controls).onchange = e => { FILTER.rarity = e.target.value; paint(); };
+  $('#view', controls).onclick = () => { FILTER.view = FILTER.view === 'grid' ? 'list' : 'grid'; render(); };
+  controls.querySelectorAll('.kind').forEach(b => b.onclick = () => { FILTER.kind = b.dataset.kind; render(); });
   $('#refresh', controls).onclick = e => refreshPrices(e.currentTarget);
 }
 
-function cardTile(c) {
+/* Shared bits between the two layouts. */
+const stateLabel = c => c.grade || (c.kind === 'sealed' ? 'Sealed' : c.condition || 'NM');
+const subLabel = c => c.kind === 'sealed'
+  ? (c.setName || 'Sealed')
+  : `${c.setName || ''} ${c.number || ''}${c.printedTotal ? '/' + c.printedTotal : ''}`.trim();
+
+async function setTradeQty(c, n) {
+  c.tradeQty = Math.max(0, Math.min(c.qty || 1, n));
+  delete c.forTrade;               // superseded by tradeQty
+  await DB.put(c);
+  render();
+}
+
+async function removeRow(c) {
+  const qty = c.qty || 1;
+  const msg = qty > 1
+    ? `Remove all ${qty} copies of ${c.name}?`
+    : `Remove ${c.name} from the collection?`;
+  if (confirm(msg)) { await DB.del(c.id); render(); }
+}
+
+/* Grid is for browsing: three across, artwork forward, one tap to flag a
+   trade. Editing quantities and deleting live in the list layout. */
+function gridTile(c) {
   const qty = c.qty || 1;
   const tq = tradeOf(c);
-  const sealed = c.kind === 'sealed';
-  const frozen = c.priceSource === 'collectr';
   const t = el('div', 'bg-ink2 rounded overflow-hidden fade-up');
-
-  const sub = sealed
-    ? esc(c.setName || 'Sealed')
-    : `${esc(c.setName)} ${c.number ? esc(c.number) : ''}${c.printedTotal ? '/' + esc(c.printedTotal) : ''}`;
-  const tags = [
-    c.grade ? esc(c.grade) : '',
-    sealed ? 'Sealed' : esc(c.condition || 'NM'),
-    qty > 1 ? 'x' + qty : ''
-  ].filter(Boolean).join(' Â· ');
-
   t.innerHTML = `
-    <div class="card-ratio">${thumb(c, 'w-full h-full')}</div>
-    <div class="p-2.5">
-      <p class="font-display text-sm leading-tight truncate">${esc(c.name)}</p>
-      <p class="text-[11px] text-muted truncate">${sub}</p>
-      <p class="text-gold font-display text-base tabular mt-1.5">${qar(valueOf(c))}</p>
-      <p class="text-[10px] text-muted tabular truncate">${usd(valueOf(c))} Â· ${tags}</p>
-      ${frozen ? `<p class="text-[10px] text-sand/60 mt-0.5">Price from Collectr, not auto-updated</p>` : ''}
-      <div class="flex gap-1.5 mt-2">
+    <div class="relative card-ratio">
+      ${thumb(c, 'w-full h-full')}
+      ${qty > 1 ? `<span class="absolute top-1 right-1 bg-ink/80 text-[10px] px-1.5 py-0.5 rounded tabular">x${qty}</span>` : ''}
+      ${tq ? `<span class="absolute bottom-1 left-1 bg-maroon text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded">${tq > 1 ? tq + ' trade' : 'Trade'}</span>` : ''}
+    </div>
+    <div class="p-1.5">
+      <p class="text-[11px] leading-tight truncate">${esc(c.name)}</p>
+      <p class="text-gold font-display text-sm tabular leading-tight">${qar(valueOf(c))}</p>
+    </div>`;
+  t.onclick = () => setTradeQty(c, tq ? 0 : qty);
+  return t;
+}
+
+/* List is for managing: full identity, trade stepper, delete. */
+function listRow(c) {
+  const qty = c.qty || 1;
+  const tq = tradeOf(c);
+  const frozen = c.priceSource === 'collectr';
+  const row = el('div', 'flex gap-3 bg-ink2 rounded p-2.5 mb-2 fade-up');
+  row.innerHTML = `
+    ${thumb(c, 'w-12 rounded card-ratio shrink-0')}
+    <div class="flex-1 min-w-0">
+      <p class="font-display text-sm truncate">${esc(c.name)}</p>
+      <p class="text-[11px] text-muted truncate">${esc(subLabel(c))}</p>
+      <p class="text-[10px] text-muted truncate">${esc(stateLabel(c))}${c.rarity ? ' Â· ' + esc(c.rarity) : ''}${qty > 1 ? ' Â· x' + qty : ''}</p>
+      ${frozen ? `<p class="text-[10px] text-sand/60">Collectr price, not auto-updated</p>` : ''}
+      <div class="flex items-center gap-1.5 mt-1.5">
         ${qty > 1 ? `
-          <button class="tminus w-7 text-sm leading-none py-1.5 rounded border ${tq ? 'border-maroon' : 'border-muted/30 text-muted'}">â</button>
-          <span class="flex-1 text-[10px] uppercase tracking-[0.1em] py-1.5 text-center tabular ${tq ? 'text-gold' : 'text-muted'}">${tq ? tq + '/' + qty + ' trade' : 'Keep all'}</span>
-          <button class="tplus w-7 text-sm leading-none py-1.5 rounded border ${tq < qty ? 'border-maroon' : 'border-muted/30 text-muted'}">+</button>
+          <button class="tminus w-6 text-sm leading-none py-1 rounded border ${tq ? 'border-maroon' : 'border-muted/30 text-muted'}">â</button>
+          <span class="text-[10px] uppercase tracking-[0.1em] tabular ${tq ? 'text-gold' : 'text-muted'} w-16 text-center">${tq ? tq + '/' + qty : 'Keep'}</span>
+          <button class="tplus w-6 text-sm leading-none py-1 rounded border ${tq < qty ? 'border-maroon' : 'border-muted/30 text-muted'}">+</button>
         ` : `
-          <button class="trade flex-1 text-[10px] uppercase tracking-[0.1em] py-1.5 rounded border ${tq ? 'bg-maroon border-maroon' : 'border-muted/30 text-muted'}">${tq ? 'For trade' : 'Keep'}</button>
+          <button class="trade text-[10px] uppercase tracking-[0.1em] px-2 py-1 rounded border ${tq ? 'bg-maroon border-maroon' : 'border-muted/30 text-muted'}">${tq ? 'For trade' : 'Keep'}</button>
         `}
-        <button class="del text-[10px] px-2 py-1.5 rounded border border-muted/30 text-muted">â</button>
+        <button class="del ml-auto text-[10px] px-2 py-1 rounded border border-muted/30 text-muted">â</button>
       </div>
+    </div>
+    <div class="text-right shrink-0">
+      <p class="text-gold font-display tabular">${qar(valueOf(c))}</p>
+      <p class="text-[10px] text-muted tabular">${usd(valueOf(c))}</p>
     </div>`;
 
-  const setTrade = async n => {
-    c.tradeQty = Math.max(0, Math.min(qty, n));
-    delete c.forTrade;             // superseded by tradeQty
-    await DB.put(c);
-    render();
-  };
-  const q = s => t.querySelector(s);
+  const q = sel => row.querySelector(sel);
   if (qty > 1) {
-    q('.tminus').onclick = () => setTrade(tq - 1);
-    q('.tplus').onclick = () => setTrade(tq + 1);
+    q('.tminus').onclick = () => setTradeQty(c, tq - 1);
+    q('.tplus').onclick = () => setTradeQty(c, tq + 1);
   } else {
-    q('.trade').onclick = () => setTrade(tq ? 0 : 1);
+    q('.trade').onclick = () => setTradeQty(c, tq ? 0 : 1);
   }
-  q('.del').onclick = async () => {
-    const msg = qty > 1
-      ? `Remove all ${qty} copies of ${c.name}?`
-      : `Remove ${c.name} from the collection?`;
-    if (confirm(msg)) { await DB.del(c.id); render(); }
-  };
-  return t;
+  q('.del').onclick = () => removeRow(c);
+  return row;
 }
 
 async function refreshPrices(btn) {
@@ -878,6 +943,7 @@ function viewReview(v) {
       kind: 'single',
       cardId: c.cardId, name: c.name, setName: c.setName, number: c.number,
       printedTotal: c.printedTotal, image: c.image, variant: c.variant,
+      rarity: c.rarity || '',
       printing: c.printing, priceUsd: c.priceUsd, priceSource: 'tcgplayer',
       condition: c.condition || 'NM', grade: '', era: '',
       qty: 1, tradeQty: 0, addedAt: Date.now(), priceUpdated: Date.now()
@@ -1009,6 +1075,9 @@ async function viewSettings(v) {
 
       <button id="s-export" class="w-full border border-muted/30 text-muted py-3 rounded text-sm">Export collection as CSV</button>
 
+      <button id="s-clear" class="w-full border border-maroon text-maroon py-3 rounded text-sm">Clear collection</button>
+      <p class="text-[11px] text-muted -mt-3">Deletes every row. Settings and the card database cache are kept. Export first if you want a copy.</p>
+
       ${installPrompt ? `<button id="s-install" class="w-full border border-gold/40 text-gold py-3 rounded text-sm">Install to home screen</button>` : ''}
     </div>`;
 
@@ -1041,11 +1110,22 @@ async function viewSettings(v) {
         toast('Nothing importable in that file.', 'bad');
         return;
       }
-      IMPORT = { rows: kept, skipped, stage: 'review', done: 0, total: 0 };
+      const existing = await DB.all();
+      IMPORT = { rows: kept, skipped, stage: 'review', done: 0, total: 0, existing: existing.length };
       render();
     } catch (err) {
       toast('Could not read that file: ' + err.message, 'bad');
     }
+  };
+
+  $('#s-clear').onclick = async () => {
+    const n = (await DB.all()).length;
+    if (!n) { toast('Collection is already empty.'); return; }
+    if (!confirm(`Delete all ${n} rows? Export first if you want a copy.`)) return;
+    if (!confirm('Last check. This cannot be undone.')) return;
+    await DB.clear();
+    toast('Collection cleared');
+    render();
   };
 
   $('#s-export').onclick = async () => {
@@ -1100,6 +1180,11 @@ function viewImport(v) {
       <p class="font-display">Total</p>
       <p class="text-gold font-display text-xl tabular">${qar(worth(rows))}</p>
     </div>
+    ${IMPORT.existing ? `
+      <div class="border border-gold/50 rounded p-3 mb-4">
+        <p class="text-[11px] uppercase tracking-[0.14em] text-gold mb-1">Collection is not empty</p>
+        <p class="text-[11px] text-muted">There are already ${IMPORT.existing} rows. Matching rows will stack and quantities will add up. If you are re-importing the same file, clear the collection in Settings first.</p>
+      </div>` : ''}
     ${skipped.length ? `
       <div class="bg-ink2 rounded p-3 mb-4">
         <p class="text-[11px] uppercase tracking-[0.14em] text-gold mb-1.5">${skipped.length} row${skipped.length === 1 ? '' : 's'} left out</p>
@@ -1128,7 +1213,7 @@ function viewImport(v) {
     IMPORT.stage = 'running';
     IMPORT.total = raw.length;
     render();
-    await enrichImport(rows, (d, t) => {
+    const matched = await enrichImport(rows, (d, t) => {
       IMPORT.done = d; IMPORT.total = t;
       const bar = $('#view .bg-maroon[style]');
       const label = $('#view .text-gold.text-center');
@@ -1136,8 +1221,9 @@ function viewImport(v) {
       if (label) label.textContent = `Matching singles ${d} of ${t}`;
     });
     const { added, stacked } = await commitRows(rows);
+    const singles = rows.filter(r => r.kind === 'single').length;
     IMPORT = null;
-    toast(stacked ? `${added} imported, ${stacked} stacked` : `${added} imported`);
+    toast(`${added} imported, ${stacked} stacked, ${matched}/${singles} matched to the catalog`);
     go('collection');
   };
   cancel.onclick = () => { IMPORT = null; render(); };
