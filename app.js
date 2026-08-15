@@ -234,16 +234,57 @@ async function ptcgQuery(q, fresh = false) {
   return out;
 }
 
+/* Collectr and pokemontcg.io name the same things differently. Collectr
+   prefixes the ex-era sets with "EX " and qualifies card names in
+   parentheses, so "Gyarados (Delta Species)" in "EX Holon Phantoms" is
+   "Gyarados Î´" in "Holon Phantoms" and every exact-match query misses.
+   Generate the plausible spellings and try each. */
+function setVariants(set) {
+  const out = [];
+  const push = x => { x = (x || '').trim(); if (x && !out.includes(x)) out.push(x); };
+  push(set);
+  push(String(set || '').replace(/^EX\s+/i, ''));   // EX Holon Phantoms -> Holon Phantoms
+  push(String(set || '').replace(/^SV:\s*/i, ''));   // SV: 151 -> 151
+  push(String(set || '').split(':')[0]);             // Generations: Radiant Collection -> Generations
+  return out;
+}
+
+/* Compare set names ignoring case, accents and punctuation, so Collectr's
+   "Pokemon Go" and the catalog's "PokÃ©mon GO" are recognised as the same set. */
+const slug = x => String(x || '').toLowerCase().normalize('NFD')
+  .replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]/g, '');
+
+function setMatches(wantSet, gotSet) {
+  if (!wantSet) return true;              // nothing to check against
+  const g = slug(gotSet);
+  if (!g) return false;
+  return setVariants(wantSet).some(v => {
+    const w = slug(v);
+    if (!w) return false;
+    if (w === g) return true;
+    return w.length >= 5 && g.length >= 5 && (w.includes(g) || g.includes(w));
+  });
+}
+
+function nameVariants(name) {
+  const out = [];
+  const push = x => { x = (x || '').trim(); if (x && !out.includes(x)) out.push(x); };
+  push(name);
+  push(String(name || '').replace(/\s*\([^)]*\)/g, ''));   // drop "(Delta Species)"
+  return out;
+}
+
 /* Prefer an exact name match, then a partial, then whatever is left. */
 function bestHit(hits, name, setName) {
   if (hits.length < 2 || !name) return hits[0];
   const want = name.toLowerCase();
-  const wantSet = (setName || '').toLowerCase();
+  const bare = want.replace(/\s*\([^)]*\)/g, '').trim();
+  const wantSets = setVariants(setName).map(x => x.toLowerCase());
   const score = c => {
     const n = (c.name || '').toLowerCase();
-    const s = (c.set?.name || '').toLowerCase();
-    let v = n === want ? 0 : n.includes(want) ? 2 : 4;
-    if (wantSet && s === wantSet) v -= 1;
+    const st = (c.set?.name || '').toLowerCase();
+    let v = n === want ? 0 : n === bare ? 1 : n.includes(bare) ? 2 : 4;
+    if (wantSets.includes(st)) v -= 1;
     return v;
   };
   return [...hits].sort((a, b) => score(a) - score(b))[0];
@@ -252,26 +293,44 @@ function bestHit(hits, name, setName) {
 /* Resolve a card reading to a real catalog card. Collector number plus
    printed total is close to a unique key, so try that first. Set name comes
    from an import row and is a strong tiebreak when the number is bare. */
-async function resolve(read) {
+async function resolve(read, strict = false) {
   const rawNum = String(read.number || '').trim();
-  const num = /^\d+$/.test(rawNum) ? rawNum.replace(/^0+/, '') || '0' : rawNum;
+  const num = /^\d+$/.test(rawNum) ? (rawNum.replace(/^0+/, '') || '0') : rawNum;
   const total = String(read.printedTotal || '').replace(/^0+/, '');
-  const name = read.name || '';
-  const set = read.setName || read.setHint || '';
-  // A promo code like SWSH260 or XY40 is distinctive enough to search on its
-  // own. A plain number like 25 is not: it would return hundreds of cards.
+  const names = nameVariants(read.name || '');
+  const sets = setVariants(read.setName || read.setHint || '');
+  // A promo code like SWSH260 is distinctive enough to search alone. A plain
+  // number like 25 is not: it would return hundreds of cards.
   const codeLike = num && !/^\d+$/.test(num);
-  let hits = [];
 
-  if (num && total) hits = await ptcgQuery(`number:"${num}" set.printedTotal:${total}`);
-  if (!hits.length && num && name) hits = await ptcgQuery(`number:"${num}" name:"${name}"`);
-  if (!hits.length && num && set) hits = await ptcgQuery(`number:"${num}" set.name:"${set}"`);
-  if (!hits.length && codeLike) hits = await ptcgQuery(`number:"${num}"`);
-  if (!hits.length && name && set) hits = await ptcgQuery(`name:"${name}" set.name:"${set}"`);
-  if (!hits.length && name) hits = await ptcgQuery(`name:"${name}"`);
-  if (!hits.length) return null;
+  const tries = [];
+  if (num && total) tries.push(`number:"${num}" set.printedTotal:${total}`);
+  if (num) for (const n of names) tries.push(`number:"${num}" name:"${n}"`);
+  if (num) for (const st of sets) tries.push(`number:"${num}" set.name:"${st}"`);
+  if (codeLike) tries.push(`number:"${num}"`);
+  for (const n of names) for (const st of sets) tries.push(`name:"${n}" set.name:"${st}"`);
+  for (const n of names) tries.push(`name:"${n}"`);
 
-  return bestHit(hits, name, set);
+  for (const q of tries) {
+    const hits = await ptcgQuery(q);
+    if (!hits.length) continue;
+    const pick = bestHit(hits, read.name || '', read.setName || read.setHint || '');
+    if (!pick) continue;
+    // On an import or retry the number came off a real record, so a match
+    // whose number disagrees is the wrong card. This matters most on the
+    // expensive singles, where a confident wrong match beats no match only in
+    // appearance.
+    if (strict) {
+      // The number came off a real record, so a match that disagrees is the
+      // wrong card. The set has to agree too, otherwise a bare name search
+      // can return a same-numbered card from an unrelated set and hand an
+      // expensive row a confident wrong price.
+      if (num && String(pick.number || '').replace(/^0+/, '') !== num) continue;
+      if (!setMatches(read.setName || '', pick.set?.name)) continue;
+    }
+    return pick;
+  }
+  return null;
 }
 
 /* Pick the price that matches the printing we think we have. */
@@ -552,7 +611,7 @@ async function enrichImport(rows, onProgress) {
   let done = 0, matched = 0, failed = 0;
   for (const r of targets) {
     try {
-      const card = await resolve(r);
+      const card = await resolve(r, true);
       if (card) {
         matched++;
         r.cardId = card.id;
@@ -710,7 +769,7 @@ async function viewCollection(v) {
     </div>`;
   v.appendChild(controls);
 
-  const unmatched = cards.filter(c => c.kind !== 'sealed' && !c.cardId);
+  const unmatched = cards.filter(c => c.kind !== 'sealed' && !c.cardId && !c.noMatch);
   if (unmatched.length) {
     const banner = el('div', 'border border-gold/50 rounded p-3 mt-3 flex items-center gap-3');
     banner.innerHTML = `
@@ -718,9 +777,21 @@ async function viewCollection(v) {
         <p class="text-[11px] uppercase tracking-[0.14em] text-gold">${unmatched.length} without a catalog match</p>
         <p class="text-[11px] text-muted">No artwork and the price cannot auto-update.</p>
       </div>
-      <button id="retry" class="shrink-0 text-xs uppercase tracking-[0.14em] text-gold border border-gold/40 px-3 py-1.5 rounded">Retry</button>`;
+      <div class="shrink-0 flex flex-col gap-1.5">
+        <button id="retry" class="text-xs uppercase tracking-[0.14em] text-gold border border-gold/40 px-3 py-1.5 rounded">Retry</button>
+        <button id="accept" class="text-[10px] uppercase tracking-[0.14em] text-muted border border-muted/30 px-3 py-1 rounded">Accept</button>
+      </div>`;
     v.appendChild(banner);
     $('#retry', banner).onclick = e => retryUnmatched(e.currentTarget, unmatched);
+    // Some cards genuinely are not in the English catalog, Japanese-only sets
+    // being the usual reason. Accepting stops the banner nagging about them
+    // forever; they keep their imported price and simply never auto-update.
+    $('#accept', banner).onclick = async () => {
+      if (!confirm(`Accept ${unmatched.length} card${unmatched.length === 1 ? '' : 's'} as not in the catalog? They keep their current price and stop showing here.`)) return;
+      for (const c of unmatched) { c.noMatch = true; await DB.put(c); }
+      toast('Accepted. Prices stay as they are.');
+      render();
+    };
   }
 
   const count = el('p', 'text-sm text-muted my-3');
@@ -848,9 +919,10 @@ async function retryUnmatched(btn, rows) {
     try {
       const card = await resolve({
         name: c.name, number: c.number, printedTotal: c.printedTotal, setName: c.setName
-      });
+      }, true);
       if (!card) continue;
       c.cardId = card.id;
+      delete c.noMatch;
       c.image = card.images?.small || c.image;
       c.rarity = card.rarity || c.rarity;
       c.printedTotal = card.set?.printedTotal || c.printedTotal;

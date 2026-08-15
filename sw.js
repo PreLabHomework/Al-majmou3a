@@ -1,5 +1,5 @@
 /* Offline shell. Collection data lives in IndexedDB and never touches the cache. */
-const CACHE = 'majmoua-v8';
+const CACHE = 'majmoua-v9';
 const SHELL = [
   './',
   './index.html',
