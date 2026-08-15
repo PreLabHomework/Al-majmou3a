@@ -8,7 +8,11 @@ const DEFAULTS = {
   workerSecret: '',     // shared secret, must match the Worker
   pokemonKey: '',       // pokemontcg.io free key (optional but recommended)
   qarRate: 3.64,        // riyal is pegged to USD, so this is a constant
-  premium: 0            // local market premium %, applied to trade asks only
+  premium: 0,           // local market premium %, applied to trade asks only
+  theme: 'dark',
+  currency: 'QAR',
+  cols: 3,              // cards per row in the large layout
+  advanced: false       // hide the technical settings by default
 };
 
 const CFG = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem('cfg') || '{}'));
@@ -95,8 +99,18 @@ const el = (tag, cls, html) => {
   return n;
 };
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const usd = n => '$' + (Number(n) || 0).toFixed(2);
-const qar = n => Math.round((Number(n) || 0) * CFG.qarRate).toLocaleString() + ' QAR';
+const inUsd = n => '$' + (Number(n) || 0).toFixed(2);
+const inQar = n => Math.round((Number(n) || 0) * CFG.qarRate).toLocaleString() + ' QAR';
+/* money() is whichever currency is selected, alt() is the other one. Stored
+   values are always USD, so switching is display only and nothing migrates. */
+const money = n => CFG.currency === 'USD' ? inUsd(n) : inQar(n);
+const alt   = n => CFG.currency === 'USD' ? inQar(n) : inUsd(n);
+
+function applyTheme() {
+  document.documentElement.dataset.theme = CFG.theme === 'light' ? 'light' : 'dark';
+  const meta = $('#themeColor');
+  if (meta) meta.setAttribute('content', CFG.theme === 'light' ? '#FAF7F5' : '#1A0D12');
+}
 
 let toastTimer;
 function toast(msg, tone = 'ok') {
@@ -140,14 +154,23 @@ const canvasToB64 = (c, q = 0.82) => c.toDataURL('image/jpeg', q).split(',')[1];
    anything that never resolved to a catalog image. */
 function thumb(c, cls) {
   if (c.image) {
-    // Catalog artwork is already a portrait card scan and fills the frame.
-    // A camera capture is whatever shape the phone took, often landscape with
-    // the card sideways, so cropping it to a card shape hides the card.
+    // Catalog artwork is a portrait card scan and fills the frame. A camera
+    // capture is whatever shape the phone took, so it must not be cropped.
     const fit = c.image.startsWith('data:') ? 'object-contain' : 'object-cover';
     return `<img src="${esc(c.image)}" alt="${esc(c.name)}" class="${cls} ${fit}" loading="lazy">`;
   }
-  const glyph = c.kind === 'sealed' ? 'â§' : '?';
-  return `<div class="${cls} bg-maroonD/40 flex items-center justify-center text-sand/50 text-2xl">${glyph}</div>`;
+  // No catalog image exists for sealed product, so an empty photo frame is
+  // just a hole. Give it a designed panel that carries the name instead.
+  if (c.kind === 'sealed') {
+    const words = String(c.name || '').split(/\s+/);
+    const short = words.slice(0, 6).join(' ') + (words.length > 6 ? '\u2026' : '');
+    return `<div class="${cls} bg-maroonD flex flex-col justify-between p-2 overflow-hidden">
+      <span class="text-[8px] uppercase tracking-[0.18em] opacity-70">Sealed</span>
+      <span class="font-display text-[11px] leading-tight break-words">${esc(short)}</span>
+      <span class="h-1 w-full bg-maroon rounded"></span>
+    </div>`;
+  }
+  return `<div class="${cls} bg-ink3 flex items-center justify-center text-muted text-xl">?</div>`;
 }
 
 /* Cards are portrait. A landscape photo usually means the phone was held
@@ -261,7 +284,7 @@ async function ptcgQuery(q, fresh = false) {
 /* Collectr and pokemontcg.io name the same things differently. Collectr
    prefixes the ex-era sets with "EX " and qualifies card names in
    parentheses, so "Gyarados (Delta Species)" in "EX Holon Phantoms" is
-   "Gyarados Î´" in "Holon Phantoms" and every exact-match query misses.
+   "Gyarados \u03b4" in "Holon Phantoms" and every exact-match query misses.
    Generate the plausible spellings and try each. */
 function setVariants(set) {
   const out = [];
@@ -274,9 +297,9 @@ function setVariants(set) {
 }
 
 /* Compare set names ignoring case, accents and punctuation, so Collectr's
-   "Pokemon Go" and the catalog's "PokÃ©mon GO" are recognised as the same set. */
+   "Pokemon Go" and the catalog's "Pok\u00e9mon GO" are recognised as the same set. */
 const slug = x => String(x || '').toLowerCase().normalize('NFD')
-  .replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]/g, '');
+  .replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
 
 function setMatches(wantSet, gotSet) {
   if (!wantSet) return true;              // nothing to check against
@@ -564,7 +587,7 @@ function parseCSV(text) {
 const csvObjects = text => {
   const rows = parseCSV(text).filter(r => r.some(f => f !== ''));
   if (!rows.length) return [];
-  const head = rows[0].map(h => h.replace(/^﻿/, '').trim());
+  const head = rows[0].map(h => h.replace(/^\ufeff/, '').trim());
   return rows.slice(1).map(r => Object.fromEntries(head.map((h, i) => [h, (r[i] ?? '').trim()])));
 };
 
@@ -718,6 +741,102 @@ async function commitRows(rows) {
   return { added, stacked };
 }
 
+/* ------------------------------------------------------------ snapshots */
+
+/* A collection is worth watching over time, not just today. Every price
+   refresh records one point, at most one a day, so the value line builds
+   itself without anyone having to remember to log anything. */
+const SNAPS_KEY = 'snaps';
+const loadSnaps = () => { try { return JSON.parse(localStorage.getItem(SNAPS_KEY) || '[]'); } catch { return []; } };
+
+function recordSnapshot(totalUsd) {
+  const snaps = loadSnaps();
+  const day = new Date().toISOString().slice(0, 10);
+  const last = snaps[snaps.length - 1];
+  if (last && last.day === day) last.usd = totalUsd;
+  else snaps.push({ day, at: Date.now(), usd: totalUsd });
+  while (snaps.length > 400) snaps.shift();
+  try { localStorage.setItem(SNAPS_KEY, JSON.stringify(snaps)); } catch {}
+}
+
+/* Simple value line. No axes: the shape and the endpoints are the message. */
+function sparkline(snaps) {
+  if (snaps.length < 2) return '';
+  const vals = snaps.map(s => s.usd);
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  const span = (hi - lo) || 1;
+  const pts = vals.map((v, i) => {
+    const x = (i / (vals.length - 1)) * 100;
+    const y = 22 - ((v - lo) / span) * 20;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const rising = vals[vals.length - 1] >= vals[0];
+  return `<svg viewBox="0 0 100 24" preserveAspectRatio="none" class="w-full h-8" aria-hidden="true">
+    <polyline points="${pts}" fill="none" stroke="rgb(var(--c-${rising ? 'gold' : 'maroon'}))" stroke-width="1.5"
+      vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>
+  </svg>`;
+}
+
+function changeLine(snaps) {
+  if (snaps.length < 2) return '';
+  const first = snaps[0].usd, last = snaps[snaps.length - 1].usd;
+  if (!first) return '';
+  const diff = last - first;
+  const pct = (diff / first) * 100;
+  const up = diff >= 0;
+  const since = new Date(snaps[0].at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return `<p class="text-[11px] tabular ${up ? 'text-gold' : 'text-maroon'}">
+    ${up ? '+' : '\u2212'}${money(Math.abs(diff))} (${up ? '+' : '\u2212'}${Math.abs(pct).toFixed(1)}%) since ${esc(since)}</p>`;
+}
+
+/* Portfolio summary. What is it worth, what is it made of, what is the best
+   thing in it. The three questions anyone asks about a collection. */
+function summaryCard(cards) {
+  const box = el('div', 'bg-ink2 rounded p-3 mb-4 fade-up');
+  const val = g => g.reduce((s, c) => s + valueOf(c) * (c.qty || 1), 0);
+  const sealed = cards.filter(c => c.kind === 'sealed');
+  const graded = cards.filter(c => c.grade);
+  const raw = cards.filter(c => c.kind !== 'sealed' && !c.grade);
+  const total = val(cards) || 1;
+  const copies = cards.reduce((s, c) => s + (c.qty || 1), 0);
+  const top = [...cards].sort((a, b) => valueOf(b) - valueOf(a))[0];
+  const snaps = loadSnaps();
+
+  const seg = (g, cls, label) => {
+    const pct = val(g) / total * 100;
+    return pct < 0.5 ? '' : `<div class="${cls} h-full" style="width:${pct.toFixed(1)}%" title="${label} ${pct.toFixed(0)}%"></div>`;
+  };
+
+  box.innerHTML = `
+    <div class="flex items-start justify-between gap-3">
+      <div class="min-w-0">
+        <p class="text-[10px] uppercase tracking-[0.16em] text-muted">Portfolio</p>
+        <p class="font-display text-2xl text-gold tabular leading-tight">${money(val(cards))}</p>
+        <p class="text-[11px] text-muted tabular">${alt(val(cards))} \u00b7 ${copies} items</p>
+        ${changeLine(snaps)}
+      </div>
+      ${snaps.length > 1 ? `<div class="w-24 shrink-0">${sparkline(snaps)}</div>` : ''}
+    </div>
+
+    <div class="flex h-1.5 rounded overflow-hidden mt-3 bg-ink3">
+      ${seg(sealed, 'bg-maroon', 'Sealed')}${seg(raw, 'bg-gold', 'Singles')}${seg(graded, 'bg-sand', 'Graded')}
+    </div>
+    <div class="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-[10px] text-muted">
+      ${sealed.length ? `<span><span class="inline-block w-2 h-2 rounded-sm bg-maroon align-middle"></span> Sealed ${money(val(sealed))}</span>` : ''}
+      ${raw.length ? `<span><span class="inline-block w-2 h-2 rounded-sm bg-gold align-middle"></span> Singles ${money(val(raw))}</span>` : ''}
+      ${graded.length ? `<span><span class="inline-block w-2 h-2 rounded-sm bg-sand align-middle"></span> Graded ${money(val(graded))}</span>` : ''}
+    </div>
+
+    ${top ? `<div class="flex items-center gap-2 mt-3 pt-3 border-t border-maroonD">
+      <span class="text-[10px] uppercase tracking-[0.16em] text-muted shrink-0">Best card</span>
+      <span class="text-[12px] truncate flex-1">${esc(top.name)}</span>
+      <span class="text-gold font-display tabular shrink-0">${money(valueOf(top))}</span>
+    </div>` : ''}`;
+
+  if (top) box.querySelector('.border-t')?.addEventListener('click', () => openSheet(top));
+  return box;
+}
+
 /* ----------------------------------------------------------------- views */
 
 let TAB = 'collection';
@@ -730,9 +849,9 @@ let SHEET = null;   // card open in the detail sheet, if any
    Mini: six or eight across, artwork only, for scanning a big collection by
    eye. Tapping a card in any of them opens the detail sheet. */
 const VIEWS = [
-  ['large', 'â¦', 'Large icons'],
-  ['list',  'â¤', 'Details'],
-  ['mini',  'â©', 'Small icons']
+  ['large', '\u25a6', 'Large icons'],
+  ['list',  '\u25a4', 'Details'],
+  ['mini',  '\u25a9', 'Small icons']
 ];
 
 async function render() {
@@ -753,8 +872,20 @@ async function render() {
 async function updateTotals() {
   const cards = await DB.all();
   const total = cards.reduce((s, c) => s + valueOf(c) * (c.qty || 1), 0);
-  $('#totalValue').textContent = qar(total);
-  $('#totalUsd').textContent = usd(total);
+  $('#totalValue').textContent = money(total);
+  $('#totalUsd').textContent = alt(total);
+}
+
+/* Tapping the headline value flips the currency. Faster than going to
+   Settings for something you want to check both ways. */
+function wireHeader() {
+  const box = $('#totalBox');
+  if (!box) return;
+  box.onclick = () => {
+    CFG.currency = CFG.currency === 'USD' ? 'QAR' : 'USD';
+    saveCfg();
+    render();
+  };
 }
 
 /* ---- collection ---- */
@@ -796,6 +927,8 @@ async function viewCollection(v) {
   // Filter options come from what he actually owns, so no empty choices.
   const sets = [...new Set(cards.map(c => c.setName).filter(Boolean))].sort();
   const rarities = [...new Set(cards.map(c => c.rarity).filter(Boolean))].sort();
+  v.appendChild(summaryCard(cards));
+
   const KINDS = [['all', 'All'], ['singles', 'Singles'], ['sealed', 'Sealed'], ['trade', 'Trade']];
 
   const controls = el('div', 'mb-3 fade-up');
@@ -870,9 +1003,10 @@ async function viewCollection(v) {
     const copies = shown.reduce((s, c) => s + (c.qty || 1), 0);
     const worth = shown.reduce((s, c) => s + valueOf(c) * (c.qty || 1), 0);
     count.textContent = shown.length
-      ? `${copies} item${copies === 1 ? '' : 's'} Â· ${qar(worth)}`
+      ? `${copies} item${copies === 1 ? '' : 's'} \u00b7 ${money(worth)}`
       : 'Nothing matches that.';
-    list.className = FILTER.view === 'large' ? 'grid grid-cols-3 gap-2'
+    const colClass = { 2: 'grid-cols-2', 3: 'grid-cols-3', 4: 'grid-cols-4' }[CFG.cols] || 'grid-cols-3';
+    list.className = FILTER.view === 'large' ? `grid ${colClass} gap-2`
       : FILTER.view === 'mini' ? 'grid grid-cols-6 sm:grid-cols-8 gap-1'
       : '';
     list.innerHTML = '';
@@ -958,8 +1092,8 @@ function renderSheet() {
           <div class="w-24 shrink-0 card-ratio rounded overflow-hidden bg-ink">${thumb(c, 'w-full h-full')}</div>
           <div class="flex-1 min-w-0">
             <p class="font-display text-lg leading-tight">${esc(c.name)}</p>
-            <p class="text-gold font-display text-2xl tabular mt-1">${qar(valueOf(c))}</p>
-            <p class="text-[11px] text-muted tabular">${usd(valueOf(c))}${qty > 1 ? ` each Â· ${qar(valueOf(c) * qty)} total` : ''}</p>
+            <p class="text-gold font-display text-2xl tabular mt-1">${money(valueOf(c))}</p>
+            <p class="text-[11px] text-muted tabular">${alt(valueOf(c))}${qty > 1 ? ` each \u00b7 ${money(valueOf(c) * qty)} total` : ''}</p>
           </div>
         </div>
 
@@ -975,7 +1109,7 @@ function renderSheet() {
 
         <p class="text-[10px] uppercase tracking-[0.16em] text-muted mb-2">On the trade shelf</p>
         <div class="flex items-center gap-3 mb-4">
-          <button id="sh-minus" class="w-10 py-2 rounded border ${tq ? 'border-maroon' : 'border-muted/30 text-muted'}">â</button>
+          <button id="sh-minus" class="w-10 py-2 rounded border ${tq ? 'border-maroon' : 'border-muted/30 text-muted'}">\u2212</button>
           <span class="flex-1 text-center font-display tabular ${tq ? 'text-gold' : 'text-muted'}">${tq} of ${qty}</span>
           <button id="sh-plus" class="w-10 py-2 rounded border ${tq < qty ? 'border-maroon' : 'border-muted/30 text-muted'}">+</button>
         </div>
@@ -1015,16 +1149,16 @@ async function removeRow(c) {
 function gridTile(c) {
   const qty = c.qty || 1;
   const tq = tradeOf(c);
-  const t = el('div', 'bg-ink2 rounded overflow-hidden fade-up active:opacity-80');
+  const t = el('div', `bg-ink2 rounded overflow-hidden fade-up active:opacity-80 ${qty > 1 ? 'stacked' : ''}`);
   t.innerHTML = `
-    <div class="relative card-ratio bg-ink">
+    <div class="relative card-ratio bg-ink3">
       ${thumb(c, 'w-full h-full')}
-      ${qty > 1 ? `<span class="absolute top-1 right-1 bg-ink/85 text-[10px] px-1.5 py-0.5 rounded tabular">x${qty}</span>` : ''}
-      ${tq ? `<span class="absolute bottom-1 left-1 bg-maroon text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded">${tq > 1 ? tq + ' trade' : 'Trade'}</span>` : ''}
+      ${qty > 1 ? `<span class="absolute top-1 left-1 bg-maroon text-bone text-[10px] font-display px-1.5 py-0.5 rounded tabular">${qty} copies</span>` : ''}
+      ${tq ? `<span class="absolute bottom-1 left-1 right-1 bg-gold text-center text-[9px] uppercase tracking-wider py-0.5 rounded" style="color:rgb(var(--c-ink))">${tq > 1 ? tq + ' for trade' : 'For trade'}</span>` : ''}
     </div>
     <div class="p-1.5">
       <p class="text-[11px] leading-tight truncate">${esc(c.name)}</p>
-      <p class="text-gold font-display text-sm tabular leading-tight">${qar(valueOf(c))}</p>
+      <p class="text-gold font-display text-sm tabular leading-tight">${money(valueOf(c))}</p>
     </div>`;
   t.onclick = () => openSheet(c);
   return t;
@@ -1034,12 +1168,12 @@ function gridTile(c) {
 function miniTile(c) {
   const qty = c.qty || 1;
   const tq = tradeOf(c);
-  const t = el('div', 'relative card-ratio rounded overflow-hidden bg-ink2 fade-up active:opacity-70');
+  const t = el('div', `relative card-ratio rounded overflow-hidden bg-ink3 fade-up active:opacity-70 ${qty > 1 ? 'stacked' : ''}`);
   t.innerHTML = `
     ${thumb(c, 'w-full h-full')}
-    ${qty > 1 ? `<span class="absolute top-0 right-0 bg-ink/85 text-[9px] px-1 rounded-bl tabular">${qty}</span>` : ''}
-    ${tq ? `<span class="absolute bottom-0 left-0 right-0 h-1 bg-maroon"></span>` : ''}`;
-  t.title = `${c.name} Â· ${qar(valueOf(c))}`;
+    ${qty > 1 ? `<span class="absolute top-0 left-0 bg-maroon text-bone text-[9px] px-1 rounded-br tabular">${qty}</span>` : ''}
+    ${tq ? `<span class="absolute bottom-0 inset-x-0 h-1.5 bg-gold"></span>` : ''}`;
+  t.title = `${c.name} \u00b7 ${money(valueOf(c))}`;
   t.onclick = () => openSheet(c);
   return t;
 }
@@ -1055,22 +1189,22 @@ function listRow(c) {
     <div class="flex-1 min-w-0">
       <p class="font-display text-sm truncate">${esc(c.name)}</p>
       <p class="text-[11px] text-muted truncate">${esc(subLabel(c))}</p>
-      <p class="text-[10px] text-muted truncate">${esc(stateLabel(c))}${c.rarity ? ' Â· ' + esc(c.rarity) : ''}${qty > 1 ? ' Â· x' + qty : ''}</p>
+      <p class="text-[10px] text-muted truncate">${esc(stateLabel(c))}${c.rarity ? ' \u00b7 ' + esc(c.rarity) : ''}${qty > 1 ? ' \u00b7 x' + qty : ''}</p>
       ${frozen ? `<p class="text-[10px] text-sand/60">Collectr price, not auto-updated</p>` : ''}
       <div class="flex items-center gap-1.5 mt-1.5">
         ${qty > 1 ? `
-          <button class="tminus w-6 text-sm leading-none py-1 rounded border ${tq ? 'border-maroon' : 'border-muted/30 text-muted'}">â</button>
+          <button class="tminus w-6 text-sm leading-none py-1 rounded border ${tq ? 'border-maroon' : 'border-muted/30 text-muted'}">\u2212</button>
           <span class="text-[10px] uppercase tracking-[0.1em] tabular ${tq ? 'text-gold' : 'text-muted'} w-16 text-center">${tq ? tq + '/' + qty : 'Keep'}</span>
           <button class="tplus w-6 text-sm leading-none py-1 rounded border ${tq < qty ? 'border-maroon' : 'border-muted/30 text-muted'}">+</button>
         ` : `
           <button class="trade text-[10px] uppercase tracking-[0.1em] px-2 py-1 rounded border ${tq ? 'bg-maroon border-maroon' : 'border-muted/30 text-muted'}">${tq ? 'For trade' : 'Keep'}</button>
         `}
-        <button class="del ml-auto text-[10px] px-2 py-1 rounded border border-muted/30 text-muted">â</button>
+        <button class="del ml-auto text-[10px] px-2 py-1 rounded border border-muted/30 text-muted">\u2715</button>
       </div>
     </div>
     <div class="text-right shrink-0">
-      <p class="text-gold font-display tabular">${qar(valueOf(c))}</p>
-      <p class="text-[10px] text-muted tabular">${usd(valueOf(c))}</p>
+      <p class="text-gold font-display tabular">${money(valueOf(c))}</p>
+      <p class="text-[10px] text-muted tabular">${alt(valueOf(c))}</p>
     </div>`;
 
   const q = sel => row.querySelector(sel);
@@ -1135,6 +1269,8 @@ async function refreshPrices(btn) {
     } catch { /* keep the old price rather than blanking it */ }
   }
   btn.disabled = false;
+  const fresh = await DB.all();
+  recordSnapshot(fresh.reduce((s, c) => s + valueOf(c) * (c.qty || 1), 0));
   toast(held ? `${cards.length} updated, ${held} held` : `${cards.length} updated`);
   render();
 }
@@ -1151,7 +1287,7 @@ async function viewScan(v) {
       <label class="block bg-maroon rounded p-5 mb-3 active:opacity-90">
         <input type="file" accept="image/*" capture="environment" class="hidden" id="single">
         <div class="flex items-center gap-4">
-          <span class="text-3xl">â</span>
+          <span class="text-3xl">\u25ce</span>
           <div>
             <p class="font-display text-lg leading-tight">Precision</p>
             <p class="text-xs opacity-80">One card, one photo. Highest accuracy.</p>
@@ -1162,7 +1298,7 @@ async function viewScan(v) {
       <label class="block bg-ink2 border border-maroonD rounded p-5 active:opacity-90">
         <input type="file" accept="image/*" capture="environment" class="hidden" id="bulk">
         <div class="flex items-center gap-4">
-          <span class="text-3xl">â¦</span>
+          <span class="text-3xl">\u25a6</span>
           <div>
             <p class="font-display text-lg leading-tight">Bulk grid</p>
             <p class="text-xs text-muted">Loose cards spread out, one photo, all at once.</p>
@@ -1239,8 +1375,8 @@ function viewReview(v) {
   const head = el('div', 'mb-4 fade-up');
   head.innerHTML = `
     <p class="font-display text-xl">${PENDING.length} card${PENDING.length > 1 ? 's' : ''} read</p>
-    <p class="text-gold font-display text-2xl tabular">${qar(total)}</p>
-    <p class="text-xs text-muted">${usd(total)} at market.${bad.length ? ` ${bad.length} could not be identified.` : ' Check anything flagged before saving.'}</p>`;
+    <p class="text-gold font-display text-2xl tabular">${money(total)}</p>
+    <p class="text-xs text-muted">${alt(total)} at market.${bad.length ? ` ${bad.length} could not be identified.` : ' Check anything flagged before saving.'}</p>`;
   v.appendChild(head);
 
   PENDING.forEach((c, i) => {
@@ -1251,7 +1387,7 @@ function viewReview(v) {
       ${thumb(c, 'w-14 rounded card-ratio shrink-0 bg-ink')}
       <div class="flex-1 min-w-0">
         <p class="font-display text-sm truncate">${esc(c.name)}</p>
-        ${failed ? '' : `<p class="text-[11px] text-muted truncate">${esc(c.setName)} ${esc(c.number)}${c.printedTotal ? '/' + esc(c.printedTotal) : ''} Â· ${esc(c.printing || c.variant)}</p>`}
+        ${failed ? '' : `<p class="text-[11px] text-muted truncate">${esc(c.setName)} ${esc(c.number)}${c.printedTotal ? '/' + esc(c.printedTotal) : ''} \u00b7 ${esc(c.printing || c.variant)}</p>`}
         ${c.error ? `<p class="text-[11px] text-sand/80 mt-0.5 break-words">${esc(c.error)}</p>` : ''}
         ${low ? `<p class="text-[11px] text-gold mt-0.5">Low confidence, worth a look</p>` : ''}
         ${c.existingQty ? `<p class="text-[11px] text-sand/70 mt-0.5">Already have ${c.existingQty}</p>` : ''}
@@ -1262,7 +1398,7 @@ function viewReview(v) {
             <select class="cond bg-ink text-xs rounded px-2 py-1 border border-muted/30">
               ${CONDITIONS.map(k => `<option ${k === (c.condition || 'NM') ? 'selected' : ''}>${k}</option>`).join('')}
             </select>
-            <span class="text-gold text-sm font-display tabular">${qar(valueOf(c))}</span>
+            <span class="text-gold text-sm font-display tabular">${money(valueOf(c))}</span>
           `}
           <button class="drop ml-auto text-xs text-muted px-2">Remove</button>
         </div>
@@ -1335,7 +1471,7 @@ async function viewTrade(v) {
   const total = cards.reduce((s, c) => s + askPrice(c) * tradeOf(c), 0);
   const head = el('div', 'mb-4 fade-up');
   head.innerHTML = `
-    <p class="font-display text-xl">${copies} on the shelf${copies !== cards.length ? ` Â· ${cards.length} listing${cards.length === 1 ? '' : 's'}` : ''}</p>
+    <p class="font-display text-xl">${copies} on the shelf${copies !== cards.length ? ` \u00b7 ${cards.length} listing${cards.length === 1 ? '' : 's'}` : ''}</p>
     <p class="text-gold font-display text-2xl tabular">${Math.round(total).toLocaleString()} QAR</p>
     <p class="text-xs text-muted">Asks include your ${CFG.premium || 0}% local premium.</p>`;
   v.appendChild(head);
@@ -1369,7 +1505,7 @@ async function viewTrade(v) {
       ${thumb(c, 'w-11 rounded card-ratio shrink-0')}
       <div class="flex-1 min-w-0">
         <p class="font-display text-sm truncate">${esc(c.name)}</p>
-        <p class="text-[11px] text-muted truncate">${esc(c.setName)} Â· ${esc(state)}${tradeOf(c) > 1 ? ' Â· x' + tradeOf(c) : ''}</p>
+        <p class="text-[11px] text-muted truncate">${esc(c.setName)} \u00b7 ${esc(state)}${tradeOf(c) > 1 ? ' \u00b7 x' + tradeOf(c) : ''}</p>
       </div>
       <div class="text-right shrink-0">
         <p class="text-gold font-display tabular">${Math.round(askPrice(c)).toLocaleString()}</p>
@@ -1384,59 +1520,95 @@ async function viewTrade(v) {
 async function viewSettings(v) {
   if (IMPORT) return viewImport(v);
 
+  const seg = (id, opts, current) => `
+    <div class="flex rounded border border-maroonD overflow-hidden">
+      ${opts.map(([val, label]) => `<button data-${id}="${val}"
+        class="${id} flex-1 text-[11px] uppercase tracking-[0.12em] py-2 ${current == val ? 'bg-maroon text-bone' : 'text-muted'}">${label}</button>`).join('')}
+    </div>`;
+
   v.innerHTML = `
     <div class="fade-up space-y-5">
-      <div>
-        <label class="block text-xs uppercase tracking-[0.16em] text-muted mb-1.5">Scanner endpoint</label>
-        <input id="s-url" value="${esc(CFG.workerUrl)}" placeholder="https://your-worker.workers.dev"
-          class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm">
-        <p class="text-[11px] text-muted mt-1">Your Cloudflare Worker. It holds the API key so the app does not have to.</p>
-      </div>
-      <div>
-        <label class="block text-xs uppercase tracking-[0.16em] text-muted mb-1.5">Shared secret</label>
-        <input id="s-secret" value="${esc(CFG.workerSecret)}" type="password"
-          class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm">
-      </div>
-      <div>
-        <label class="block text-xs uppercase tracking-[0.16em] text-muted mb-1.5">pokemontcg.io key</label>
-        <input id="s-ptcg" value="${esc(CFG.pokemonKey)}" placeholder="Optional, raises the daily limit"
-          class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm">
-      </div>
 
-      <div class="serrate serrate-thin"></div>
-
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs uppercase tracking-[0.16em] text-muted mb-1.5">USD to QAR</label>
-          <input id="s-rate" value="${CFG.qarRate}" inputmode="decimal"
-            class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm tabular">
-        </div>
-        <div>
-          <label class="block text-xs uppercase tracking-[0.16em] text-muted mb-1.5">Local premium %</label>
-          <input id="s-prem" value="${CFG.premium}" inputmode="decimal"
-            class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm tabular">
-        </div>
+      <p class="text-xs uppercase tracking-[0.16em] text-muted">Appearance</p>
+      ${seg('theme', [['dark', 'Dark'], ['light', 'Light']], CFG.theme)}
+      ${seg('curr', [['QAR', 'Riyals'], ['USD', 'Dollars']], CFG.currency)}
+      <div>
+        <p class="text-[11px] text-muted mb-1.5">Cards per row</p>
+        ${seg('cols', [[2, 'Two'], [3, 'Three'], [4, 'Four']], CFG.cols)}
       </div>
-      <p class="text-[11px] text-muted">The riyal is pegged at 3.64 to the dollar, so that rate rarely moves. The premium is what Doha actually pays over TCGplayer market.</p>
-
-      <button id="s-save" class="w-full bg-maroon py-3 rounded font-display tracking-wide">Save settings</button>
 
       <div class="serrate serrate-thin"></div>
 
       <p class="text-xs uppercase tracking-[0.16em] text-muted">Collection</p>
-      <label class="block w-full bg-maroonD py-3 rounded font-display tracking-wide text-center active:opacity-90">
+      <label class="block w-full bg-maroon py-3 rounded font-display tracking-wide text-center active:opacity-90">
         <input type="file" accept=".csv,text/csv" class="hidden" id="s-import">
         Import a CSV
       </label>
       <p class="text-[11px] text-muted -mt-3">Takes a Collectr export. Watchlist entries are left out, and sealed and graded prices come across as they are.</p>
 
-      <button id="s-export" class="w-full border border-muted/30 text-muted py-3 rounded text-sm">Export collection as CSV</button>
+      <button id="s-export" class="w-full border border-maroonD py-3 rounded text-sm">Save a backup copy</button>
+      <p class="text-[11px] text-muted -mt-3">Downloads everything as a spreadsheet. Worth doing now and then, since the collection lives only on this phone.</p>
 
-      <button id="s-clear" class="w-full border border-maroon text-maroon py-3 rounded text-sm">Clear collection</button>
-      <p class="text-[11px] text-muted -mt-3">Deletes every row. Settings and the card database cache are kept. Export first if you want a copy.</p>
+      ${installPrompt ? `<button id="s-install" class="w-full border border-gold/50 text-gold py-3 rounded text-sm">Add to home screen</button>` : ''}
 
-      ${installPrompt ? `<button id="s-install" class="w-full border border-gold/40 text-gold py-3 rounded text-sm">Install to home screen</button>` : ''}
+      <div class="serrate serrate-thin"></div>
+
+      <button id="s-adv" class="w-full flex items-center justify-between py-2 text-xs uppercase tracking-[0.16em] text-muted">
+        <span>Technical settings</span><span>${CFG.advanced ? '\u2212' : '+'}</span>
+      </button>
+
+      <div id="adv" class="${CFG.advanced ? '' : 'hidden'} space-y-5">
+        <p class="text-[11px] text-muted">These control the card scanner and pricing. Nothing here needs changing day to day.</p>
+
+        <div>
+          <label class="block text-xs uppercase tracking-[0.16em] text-muted mb-1.5">Scanner endpoint</label>
+          <input id="s-url" value="${esc(CFG.workerUrl)}" placeholder="https://your-worker.workers.dev"
+            class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm">
+        </div>
+        <div>
+          <label class="block text-xs uppercase tracking-[0.16em] text-muted mb-1.5">Shared secret</label>
+          <input id="s-secret" value="${esc(CFG.workerSecret)}" type="password"
+            class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm">
+        </div>
+        <div>
+          <label class="block text-xs uppercase tracking-[0.16em] text-muted mb-1.5">pokemontcg.io key</label>
+          <input id="s-ptcg" value="${esc(CFG.pokemonKey)}" placeholder="Optional"
+            class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm">
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs uppercase tracking-[0.16em] text-muted mb-1.5">USD to QAR</label>
+            <input id="s-rate" value="${CFG.qarRate}" inputmode="decimal"
+              class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm tabular">
+          </div>
+          <div>
+            <label class="block text-xs uppercase tracking-[0.16em] text-muted mb-1.5">Local premium %</label>
+            <input id="s-prem" value="${CFG.premium}" inputmode="decimal"
+              class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm tabular">
+          </div>
+        </div>
+        <p class="text-[11px] text-muted">The riyal is pegged at 3.64 to the dollar. The premium is what Doha actually pays over TCGplayer market, applied to trade asks only.</p>
+
+        <button id="s-save" class="w-full bg-maroon py-3 rounded font-display tracking-wide">Save technical settings</button>
+
+        <button id="s-clear" class="w-full border border-maroon text-maroon py-3 rounded text-sm">Delete the whole collection</button>
+        <p class="text-[11px] text-muted -mt-3">Cannot be undone. Save a backup first.</p>
+      </div>
     </div>`;
+
+  // Appearance changes apply immediately: making someone save a theme is silly.
+  v.querySelectorAll('.theme').forEach(b => b.onclick = () => {
+    CFG.theme = b.dataset.theme; saveCfg(); applyTheme(); render();
+  });
+  v.querySelectorAll('.curr').forEach(b => b.onclick = () => {
+    CFG.currency = b.dataset.curr; saveCfg(); render();
+  });
+  v.querySelectorAll('.cols').forEach(b => b.onclick = () => {
+    CFG.cols = Number(b.dataset.cols); saveCfg(); render();
+  });
+
+  $('#s-adv').onclick = () => { CFG.advanced = !CFG.advanced; saveCfg(); render(); };
 
   const install = $('#s-install');
   if (install) install.onclick = async () => {
@@ -1446,7 +1618,8 @@ async function viewSettings(v) {
     render();
   };
 
-  $('#s-save').onclick = () => {
+  const save = $('#s-save');
+  if (save) save.onclick = () => {
     CFG.workerUrl = $('#s-url').value.trim();
     CFG.workerSecret = $('#s-secret').value.trim();
     CFG.pokemonKey = $('#s-ptcg').value.trim();
@@ -1457,32 +1630,30 @@ async function viewSettings(v) {
     render();
   };
 
+  const clear = $('#s-clear');
+  if (clear) clear.onclick = async () => {
+    const n = (await DB.all()).length;
+    if (!n) { toast('Collection is already empty.'); return; }
+    if (!confirm(`Delete all ${n} rows? Save a backup first if you want a copy.`)) return;
+    if (!confirm('Last check. This cannot be undone.')) return;
+    await DB.clear();
+    toast('Collection cleared');
+    render();
+  };
+
   $('#s-import').onchange = async e => {
     const file = e.target.files[0];
     if (!file) return;
     try {
       const text = await file.text();
       const { kept, skipped } = readCollectr(text);
-      if (!kept.length) {
-        toast('Nothing importable in that file.', 'bad');
-        return;
-      }
+      if (!kept.length) { toast('Nothing importable in that file.', 'bad'); return; }
       const existing = await DB.all();
       IMPORT = { rows: kept, skipped, stage: 'review', done: 0, total: 0, existing: existing.length };
       render();
     } catch (err) {
       toast('Could not read that file: ' + err.message, 'bad');
     }
-  };
-
-  $('#s-clear').onclick = async () => {
-    const n = (await DB.all()).length;
-    if (!n) { toast('Collection is already empty.'); return; }
-    if (!confirm(`Delete all ${n} rows? Export first if you want a copy.`)) return;
-    if (!confirm('Last check. This cannot be undone.')) return;
-    await DB.clear();
-    toast('Collection cleared');
-    render();
   };
 
   $('#s-export').onclick = async () => {
@@ -1498,9 +1669,10 @@ async function viewSettings(v) {
     const blob = new Blob([[head.join(','), ...rows].join('\n')], { type: 'text/csv' });
     const a = el('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `collection-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `al-majmoua-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(a.href);
+    toast('Backup saved to downloads');
   };
 }
 
@@ -1521,7 +1693,7 @@ function viewImport(v) {
         ${note ? `<p class="text-[11px] text-muted">${note}</p>` : ''}
       </div>
       <div class="text-right shrink-0 pl-3">
-        <p class="text-gold font-display tabular">${qar(worth(g))}</p>
+        <p class="text-gold font-display tabular">${money(worth(g))}</p>
         <p class="text-[10px] text-muted tabular">${copies(g)} item${copies(g) === 1 ? '' : 's'}</p>
       </div>
     </div>`;
@@ -1535,7 +1707,7 @@ function viewImport(v) {
     ${line('Graded cards', graded, 'Collectr price, locked out of refresh')}
     <div class="flex items-baseline justify-between py-3">
       <p class="font-display">Total</p>
-      <p class="text-gold font-display text-xl tabular">${qar(worth(rows))}</p>
+      <p class="text-gold font-display text-xl tabular">${money(worth(rows))}</p>
     </div>
     ${IMPORT.existing ? `
       <div class="border border-gold/50 rounded p-3 mb-4">
@@ -1545,7 +1717,7 @@ function viewImport(v) {
     ${skipped.length ? `
       <div class="bg-ink2 rounded p-3 mb-4">
         <p class="text-[11px] uppercase tracking-[0.14em] text-gold mb-1.5">${skipped.length} row${skipped.length === 1 ? '' : 's'} left out</p>
-        ${skipped.slice(0, 6).map(s => `<p class="text-[11px] text-muted truncate">${esc(s.name)} Â· ${esc(s.why)}</p>`).join('')}
+        ${skipped.slice(0, 6).map(s => `<p class="text-[11px] text-muted truncate">${esc(s.name)} \u00b7 ${esc(s.why)}</p>`).join('')}
         ${skipped.length > 6 ? `<p class="text-[11px] text-muted">and ${skipped.length - 6} more</p>` : ''}
       </div>` : ''}`;
   v.appendChild(head);
@@ -1578,6 +1750,8 @@ function viewImport(v) {
       if (label) label.textContent = `Matching singles ${d} of ${t}`;
     });
     const { added, stacked } = await commitRows(rows);
+    const fresh = await DB.all();
+    recordSnapshot(fresh.reduce((s, c) => s + valueOf(c) * (c.qty || 1), 0));
     IMPORT = null;
     toast(`${added} imported, ${stacked} stacked, ${stats.matched}/${stats.total} matched` +
       (stats.failed ? `, ${stats.failed} lookup${stats.failed === 1 ? '' : 's'} failed` : ''));
@@ -1656,6 +1830,9 @@ window.addEventListener('appinstalled', () => {
   installPrompt = null;
   if (TAB === 'settings') render();
 });
+
+applyTheme();
+wireHeader();
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 

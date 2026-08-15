@@ -1,11 +1,10 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#1A0D12">
+<meta name="theme-color" content="#1A0D12" id="themeColor">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Al Majmoua</title>
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icon-192.png">
@@ -14,18 +13,23 @@
 <link href="https://fonts.googleapis.com/css2?family=Reem+Kufi:wght@400;600;700&family=Cairo:wght@300;400;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
+/* Colours are CSS variables so the whole palette can flip at runtime.
+   Tailwind needs the rgb(... / <alpha-value>) form for bg-ink/80 to work. */
 tailwind.config = {
   theme: {
     extend: {
       colors: {
-        ink:     '#1A0D12',
-        ink2:    '#241017',
-        maroon:  '#8A1538',
-        maroonD: '#5C0E25',
-        bone:    '#F7F3EE',
-        sand:    '#D9C7A7',
-        gold:    '#C9A227',
-        muted:   '#8B7A78'
+        ink:     'rgb(var(--c-ink) / <alpha-value>)',
+        ink2:    'rgb(var(--c-ink2) / <alpha-value>)',
+        ink3:    'rgb(var(--c-ink3) / <alpha-value>)',
+        maroon:  'rgb(var(--c-maroon) / <alpha-value>)',
+        maroonD: 'rgb(var(--c-maroonD) / <alpha-value>)',
+        bone:    'rgb(var(--c-bone) / <alpha-value>)',
+        fg:      'rgb(var(--c-fg) / <alpha-value>)',
+        sand:    'rgb(var(--c-sand) / <alpha-value>)',
+        gold:    'rgb(var(--c-gold) / <alpha-value>)',
+        muted:   'rgb(var(--c-muted) / <alpha-value>)',
+        scrim:   'rgb(var(--c-scrim) / <alpha-value>)'
       },
       fontFamily: {
         display: ['"Reem Kufi"', 'sans-serif'],
@@ -36,70 +40,120 @@ tailwind.config = {
 }
 </script>
 <style>
-  html, body { background: #1A0D12; color: #F7F3EE; font-family: Cairo, sans-serif; overscroll-behavior-y: none; }
+  :root, [data-theme="dark"] {
+    --c-ink:     26 13 18;
+    --c-ink2:    36 16 23;
+    --c-ink3:    48 22 31;
+    --c-maroon:  138 21 56;
+    --c-maroonD: 92 14 37;
+    --c-bone:    247 243 238;   /* always light: sits on maroon */
+    --c-fg:      247 243 238;   /* body text */
+    --c-sand:    217 199 167;
+    --c-gold:    201 162 39;
+    --c-muted:   150 132 130;
+    --c-scrim:   12 6 8;
+    --shadow: none;
+  }
+  /* Light keeps the maroon and gold but gives the page back to white, so the
+     colour reads as an accent rather than a wash. */
+  [data-theme="light"] {
+    --c-ink:     250 247 245;
+    --c-ink2:    255 255 255;
+    --c-ink3:    243 237 236;
+    --c-maroon:  138 21 56;
+    --c-maroonD: 226 208 213;
+    --c-bone:    247 243 238;
+    --c-fg:      38 20 26;
+    --c-sand:    124 104 82;
+    --c-gold:    150 112 12;
+    --c-muted:   124 110 108;
+    --c-scrim:   38 20 26;
+    --shadow: 0 1px 2px rgb(38 20 26 / .06), 0 1px 8px rgb(38 20 26 / .04);
+  }
+
+  html, body {
+    background: rgb(var(--c-ink));
+    color: rgb(var(--c-fg));
+    font-family: Cairo, sans-serif;
+    overscroll-behavior-y: none;
+  }
   * { -webkit-tap-highlight-color: transparent; }
 
-  /* Signature: the nine-point serrated edge from the flag. */
+  /* Surfaces get a hairline and a soft shadow in light mode, where flat
+     panels on white have nothing to separate them. */
+  [data-theme="light"] .bg-ink2 { box-shadow: var(--shadow); }
+
+  /* The nine-point serrated edge from the flag. */
   .serrate {
     height: 14px;
-    background: #8A1538;
+    background: rgb(var(--c-maroon));
     -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 90 14' preserveAspectRatio='none'%3E%3Cpath d='M0 0h90v7L85 14 80 7 75 14 70 7 65 14 60 7 55 14 50 7 45 14 40 7 35 14 30 7 25 14 20 7 15 14 10 7 5 14 0 7Z' fill='%23fff'/%3E%3C/svg%3E");
     mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 90 14' preserveAspectRatio='none'%3E%3Cpath d='M0 0h90v7L85 14 80 7 75 14 70 7 65 14 60 7 55 14 50 7 45 14 40 7 35 14 30 7 25 14 20 7 15 14 10 7 5 14 0 7Z' fill='%23fff'/%3E%3C/svg%3E");
     -webkit-mask-size: 100% 100%;
     mask-size: 100% 100%;
   }
-  .serrate-thin { height: 8px; opacity: .5; }
+  .serrate-thin { height: 8px; opacity: .45; }
 
   .card-ratio { aspect-ratio: 63 / 88; }
   .tabular { font-variant-numeric: tabular-nums; }
-  .fade-up { animation: fadeUp .32s cubic-bezier(.2,.7,.3,1) both; }
-  @keyframes fadeUp { from { opacity:0; transform: translateY(10px) } to { opacity:1; transform:none } }
-  .shutter { position:fixed; inset:0; background:#F7F3EE; opacity:0; pointer-events:none; z-index:80; }
+  .fade-up { animation: fadeUp .3s cubic-bezier(.2,.7,.3,1) both; }
+  @keyframes fadeUp { from { opacity:0; transform: translateY(8px) } to { opacity:1; transform:none } }
+  .shutter { position:fixed; inset:0; background:#fff; opacity:0; pointer-events:none; z-index:80; }
   .shutter.fire { animation: flash .28s ease-out; }
-  @keyframes flash { 0%{opacity:.85} 100%{opacity:0} }
+  @keyframes flash { 0%{opacity:.8} 100%{opacity:0} }
   @media (prefers-reduced-motion: reduce) {
     .fade-up, .shutter.fire { animation: none; }
   }
-  :focus-visible { outline: 2px solid #C9A227; outline-offset: 2px; }
+  :focus-visible { outline: 2px solid rgb(var(--c-gold)); outline-offset: 2px; }
   .safe-b { padding-bottom: calc(env(safe-area-inset-bottom) + 0.5rem); }
+
+  /* Copies of a card: a stacked-paper edge rather than a badge in the corner. */
+  .stacked { position: relative; }
+  .stacked::before, .stacked::after {
+    content: ""; position: absolute; inset: 0; border-radius: inherit;
+    border: 1px solid rgb(var(--c-maroon) / .55); pointer-events: none;
+  }
+  .stacked::before { transform: translate(3px, -3px); z-index: -1; }
+  .stacked::after  { transform: translate(6px, -6px); z-index: -2; }
+
+  select, input { color: rgb(var(--c-fg)); }
+  select option { background: rgb(var(--c-ink2)); color: rgb(var(--c-fg)); }
 </style>
 </head>
 <body class="font-body">
 
 <div class="shutter" id="shutter"></div>
 
-<!-- Header -->
 <header class="sticky top-0 z-40 bg-ink/95 backdrop-blur">
-  <div class="flex items-end justify-between px-4 pt-4 pb-3">
-    <div>
-      <h1 class="font-display text-2xl leading-none tracking-wide">المجموعة</h1>
+  <div class="flex items-end justify-between px-4 pt-4 pb-3 gap-3">
+    <div class="min-w-0">
+      <h1 class="font-display text-2xl leading-none tracking-wide">&#1575;&#1604;&#1605;&#1580;&#1605;&#1608;&#1593;&#1577;</h1>
       <p class="text-[11px] uppercase tracking-[0.2em] text-muted mt-1">Al Majmoua</p>
     </div>
-    <div class="text-right">
+    <button id="totalBox" class="text-right shrink-0" aria-label="Switch currency">
       <p class="text-[10px] uppercase tracking-[0.18em] text-muted">Collection value</p>
-      <p id="totalValue" class="font-display text-xl text-gold tabular leading-tight">0 QAR</p>
-      <p id="totalUsd" class="text-[11px] text-muted tabular">$0.00</p>
-    </div>
+      <p id="totalValue" class="font-display text-xl text-gold tabular leading-tight">0</p>
+      <p id="totalUsd" class="text-[11px] text-muted tabular">&mdash;</p>
+    </button>
   </div>
   <div class="serrate"></div>
 </header>
 
 <main id="view" class="px-4 pt-5 pb-32 min-h-[70vh]"></main>
 
-<!-- Bottom nav -->
 <nav class="fixed bottom-0 inset-x-0 z-40 bg-ink2 border-t border-maroonD safe-b">
   <div class="grid grid-cols-4">
     <button data-tab="collection" class="tab py-3 flex flex-col items-center gap-1">
-      <span class="text-lg">▦</span><span class="text-[10px] uppercase tracking-[0.14em]">Collection</span>
+      <span class="text-lg">&#9638;</span><span class="text-[10px] uppercase tracking-[0.14em]">Collection</span>
     </button>
     <button data-tab="scan" class="tab py-3 flex flex-col items-center gap-1">
-      <span class="text-lg">◎</span><span class="text-[10px] uppercase tracking-[0.14em]">Scan</span>
+      <span class="text-lg">&#9678;</span><span class="text-[10px] uppercase tracking-[0.14em]">Scan</span>
     </button>
     <button data-tab="trade" class="tab py-3 flex flex-col items-center gap-1">
-      <span class="text-lg">⇄</span><span class="text-[10px] uppercase tracking-[0.14em]">Trade</span>
+      <span class="text-lg">&#8646;</span><span class="text-[10px] uppercase tracking-[0.14em]">Trade</span>
     </button>
     <button data-tab="settings" class="tab py-3 flex flex-col items-center gap-1">
-      <span class="text-lg">⚙</span><span class="text-[10px] uppercase tracking-[0.14em]">Settings</span>
+      <span class="text-lg">&#9881;</span><span class="text-[10px] uppercase tracking-[0.14em]">Settings</span>
     </button>
   </div>
 </nav>
