@@ -19,17 +19,31 @@ const CONDITIONS = ['NM', 'LP', 'MP', 'HP', 'DMG'];
 /* Rough TCGplayer convention, not gospel. Adjust once you see what condition
    actually costs in Doha. */
 const COND_MULT = { NM: 1, LP: 0.85, MP: 0.7, HP: 0.5, DMG: 0.3 };
-const valueOf = c => (c.priceUsd || 0) * (COND_MULT[c.condition] ?? 1);
+
+/* Sealed product has no condition, and a graded price already prices the
+   condition, so neither takes the raw-card multiplier. */
+const valueOf = c => {
+  const p = c.priceUsd || 0;
+  if (c.kind === 'sealed' || c.grade) return p;
+  return p * (COND_MULT[c.condition] ?? 1);
+};
 
 /* Copies of one printing in one condition share a row. Keyed on the catalog
-   id, not the name, because two cards can share a name; variant and condition
-   are priced differently so they stay separate rows. printing is derived from
-   variant, so it adds nothing to the key. */
-const stackKey = c => [c.cardId, c.variant || 'normal', c.condition || 'NM'].join('|');
+   id, not the name, because two cards can share a name; variant, condition
+   and grade are priced differently so they stay separate rows. Sealed has no
+   catalog id at all, so it keys on product name plus set. */
+const stackKey = c => c.kind === 'sealed'
+  ? ['sealed', c.name, c.setName].join('|')
+  : [c.cardId, c.variant || 'normal', c.condition || 'NM', c.grade || ''].join('|');
 
 /* How many copies of a row are on the trade shelf. Falls back to the old
    forTrade boolean so rows written before stacking still read correctly. */
 const tradeOf = c => c.tradeQty ?? (c.forTrade ? (c.qty || 1) : 0);
+
+/* A row is repriceable only if we can look it up and the stored price is a
+   raw-card market price. Graded and sealed prices come from elsewhere and a
+   refresh would silently overwrite them with the wrong figure. */
+const canRefresh = c => !!c.cardId && !c.grade && c.kind !== 'sealed';
 
 /* ------------------------------------------------------------------- db */
 
@@ -115,6 +129,14 @@ function fileToCanvas(file, maxEdge = 1600) {
 
 const canvasToB64 = (c, q = 0.82) => c.toDataURL('image/jpeg', q).split(',')[1];
 
+/* Artwork for a row, or a lettered placeholder for sealed product and
+   anything that never resolved to a catalog image. */
+function thumb(c, cls) {
+  if (c.image) return `<img src="${esc(c.image)}" alt="${esc(c.name)}" class="${cls} object-cover" loading="lazy">`;
+  const glyph = c.kind === 'sealed' ? 'â§' : '?';
+  return `<div class="${cls} bg-maroonD/40 flex items-center justify-center text-sand/50 text-2xl">${glyph}</div>`;
+}
+
 /* ---------------------------------------------------------------- vision */
 
 const VISION_PROMPT = `You are reading a single Pokemon trading card from a photo.
@@ -177,39 +199,53 @@ async function ptcgQuery(q, fresh = false) {
   return out;
 }
 
-/* Resolve a vision reading to a real catalog card.
-   Collector number plus printed total is close to a unique key, so try that first. */
+/* Prefer an exact name match, then a partial, then whatever is left. */
+function bestHit(hits, name, setName) {
+  if (hits.length < 2 || !name) return hits[0];
+  const want = name.toLowerCase();
+  const wantSet = (setName || '').toLowerCase();
+  const score = c => {
+    const n = (c.name || '').toLowerCase();
+    const s = (c.set?.name || '').toLowerCase();
+    let v = n === want ? 0 : n.includes(want) ? 2 : 4;
+    if (wantSet && s === wantSet) v -= 1;
+    return v;
+  };
+  return [...hits].sort((a, b) => score(a) - score(b))[0];
+}
+
+/* Resolve a card reading to a real catalog card. Collector number plus
+   printed total is close to a unique key, so try that first. Set name comes
+   from an import row and is a strong tiebreak when the number is bare. */
 async function resolve(read) {
-  const num = String(read.number || '').replace(/^0+/, '');
-  const total = String(read.printedTotal || '');
+  const raw = String(read.number || '').trim();
+  const num = /^\d+$/.test(raw) ? raw.replace(/^0+/, '') || '0' : raw;
+  const total = String(read.printedTotal || '').replace(/^0+/, '');
+  const name = read.name || '';
+  const set = read.setName || read.setHint || '';
   let hits = [];
 
   if (num && total) hits = await ptcgQuery(`number:"${num}" set.printedTotal:${total}`);
-  if (!hits.length && num && read.name) hits = await ptcgQuery(`number:"${num}" name:"${read.name}"`);
-  if (!hits.length && read.name) hits = await ptcgQuery(`name:"${read.name}"`);
+  if (!hits.length && num && name) hits = await ptcgQuery(`number:"${num}" name:"${name}"`);
+  if (!hits.length && num && set) hits = await ptcgQuery(`number:"${num}" set.name:"${set}"`);
+  if (!hits.length && name && set) hits = await ptcgQuery(`name:"${name}" set.name:"${set}"`);
+  if (!hits.length && name) hits = await ptcgQuery(`name:"${name}"`);
   if (!hits.length) return null;
 
-  if (hits.length > 1 && read.name) {
-    const want = read.name.toLowerCase();
-    hits.sort((a, b) => {
-      const s = c => (c.name || '').toLowerCase() === want ? 0
-        : (c.name || '').toLowerCase().includes(want) ? 1 : 2;
-      return s(a) - s(b);
-    });
-  }
-  return hits[0];
+  return bestHit(hits, name, set);
 }
 
 /* Pick the price that matches the printing we think we have. */
 function priceOf(card, variant) {
   const p = card?.tcgplayer?.prices;
   if (!p) return null;
-  const order = variant === 'reverse'
-    ? ['reverseHolofoil', 'holofoil', 'normal', '1stEditionHolofoil']
-    : variant === 'holo'
-      ? ['holofoil', 'reverseHolofoil', 'normal', '1stEditionHolofoil']
-      : ['normal', 'holofoil', 'reverseHolofoil', '1stEditionHolofoil'];
-  for (const k of order) {
+  const orders = {
+    reverse: ['reverseHolofoil', 'holofoil', 'normal', '1stEditionHolofoil'],
+    holo:    ['holofoil', 'reverseHolofoil', 'normal', '1stEditionHolofoil'],
+    firstEd: ['1stEditionHolofoil', '1stEditionNormal', 'holofoil', 'normal'],
+    normal:  ['normal', 'holofoil', 'reverseHolofoil', '1stEditionHolofoil']
+  };
+  for (const k of (orders[variant] || orders.normal)) {
     const v = p[k];
     if (v && (v.market || v.mid)) return { usd: v.market || v.mid, printing: k };
   }
@@ -243,7 +279,11 @@ function orderCorners(pts) {
   return [bySum[0], byDiff[0], bySum[3], byDiff[3]]; // tl, tr, br, bl
 }
 
-/* Find every card-shaped quad in a grid photo and warp each to an upright crop. */
+/* Find every card-shaped quad in a photo of loose cards and warp each to an
+   upright crop. This needs gaps between cards: touching cards merge into one
+   contour under the dilate and nothing is found. Cards in binder pockets
+   always touch, which is why binder pages do not work here and belong in the
+   CSV import instead. */
 async function cropCards(canvas) {
   await loadOpenCV();
   const W = 420, H = 588; // 63x88 at 6.6px/mm
@@ -319,6 +359,7 @@ async function processCrops(canvases, statusEl) {
       const card = await resolve(read);
       const price = card ? priceOf(card, read.variant) : null;
       results[i] = {
+        kind: 'single',
         cardId: card?.id || null,
         name: card?.name || read.name || 'Unknown card',
         setName: card?.set?.name || read.setHint || '',
@@ -328,11 +369,12 @@ async function processCrops(canvases, statusEl) {
         variant: read.variant || 'normal',
         printing: price?.printing || '',
         priceUsd: price?.usd || 0,
+        priceSource: 'tcgplayer',
         confidence: read.confidence ?? 0,
         matched: !!card
       };
     } catch (e) {
-      results[i] = { name: 'Could not read', error: e.message, image: c.toDataURL('image/jpeg', 0.6), matched: false, priceUsd: 0 };
+      results[i] = { kind: 'single', name: 'Could not read', error: e.message, image: c.toDataURL('image/jpeg', 0.6), matched: false, priceUsd: 0 };
     }
     step();
   });
@@ -345,10 +387,176 @@ async function processCrops(canvases, statusEl) {
   return results.filter(Boolean);
 }
 
+/* ----------------------------------------------------------- csv import */
+
+/* Proper CSV reader: Collectr quotes any field containing a comma, and prices
+   above a thousand always do. */
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = '', quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; } else quoted = false;
+      } else field += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ',') { row.push(field); field = ''; }
+    else if (ch === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else if (ch !== '\r') field += ch;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+const csvObjects = text => {
+  const rows = parseCSV(text).filter(r => r.some(f => f !== ''));
+  if (!rows.length) return [];
+  const head = rows[0].map(h => h.replace(/^﻿/, '').trim());
+  return rows.slice(1).map(r => Object.fromEntries(head.map((h, i) => [h, (r[i] ?? '').trim()])));
+};
+
+const num = s => {
+  const n = parseFloat(String(s ?? '').replace(/[",\s]/g, ''));
+  return Number.isFinite(n) ? n : 0;
+};
+
+/* Collectr calls the foil treatment "Variance" and mixes two ideas into it:
+   the actual foil type, and the print era. Only the foil type drives which
+   TCGplayer price applies, so era is kept separately for display. */
+const VARIANCE = {
+  'Normal': { variant: 'normal' },
+  'Holofoil': { variant: 'holo' },
+  'Reverse Holofoil': { variant: 'reverse' },
+  '1st Edition': { variant: 'firstEd', era: '1st Edition' },
+  'Unlimited': { variant: 'normal', era: 'Unlimited' }
+};
+
+/* Collector numbers arrive in six shapes: 046/189, 081, 40, SWSH260, RC5,
+   XY40. Only the slashed form carries a printed total. */
+function splitNumber(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return { number: '', printedTotal: '' };
+  const slash = s.split('/');
+  const number = slash[0].trim();
+  return {
+    number: /^\d+$/.test(number) ? (number.replace(/^0+/, '') || '0') : number,
+    printedTotal: slash[1] ? slash[1].trim().replace(/^0+/, '') : ''
+  };
+}
+
+const CONDITION_MAP = {
+  'Near Mint': 'NM', 'Lightly Played': 'LP', 'Moderately Played': 'MP',
+  'Heavily Played': 'HP', 'Damaged': 'DMG'
+};
+
+/* Turn a Collectr export into rows this app understands, and say plainly what
+   was dropped. A watchlist entry is a card he does not own; importing it would
+   inflate the collection by its full market price. */
+function readCollectr(text) {
+  const raw = csvObjects(text);
+  const kept = [], skipped = [];
+
+  // Collectr stamps the export date into the price header, so the column name
+  // differs on every export. Find it once by prefix.
+  const priceCol = Object.keys(raw[0] || {}).find(k => k.startsWith('Market Price')) || '';
+
+  for (const r of raw) {
+    const name = r['Product Name'] || '';
+    if (!name) continue;
+
+    if (r['Watchlist'] === 'true') { skipped.push({ name, why: 'watchlist, not owned' }); continue; }
+    const qty = Math.round(num(r['Quantity']));
+    if (qty < 1) { skipped.push({ name, why: 'no quantity' }); continue; }
+
+    const { number, printedTotal } = splitNumber(r['Card Number']);
+    const sealed = !number;
+    const v = VARIANCE[r['Variance']] || { variant: 'normal' };
+    const gradeRaw = r['Grade'] || '';
+    const grade = (gradeRaw && gradeRaw !== 'Ungraded') ? gradeRaw : '';
+    const date = Date.parse(r['Date Added'] || '') || Date.now();
+
+    kept.push({
+      kind: sealed ? 'sealed' : 'single',
+      cardId: null,
+      name,
+      setName: r['Set'] || '',
+      number, printedTotal,
+      image: '',
+      variant: v.variant,
+      era: v.era || '',
+      rarity: r['Rarity'] || '',
+      grade,
+      condition: CONDITION_MAP[r['Card Condition']] || 'NM',
+      qty,
+      tradeQty: 0,
+      priceUsd: num(r[priceCol]),
+      costUsd: num(r['Average Cost Paid']),
+      notes: r['Notes'] || '',
+      // Sealed and graded prices come from Collectr and stay frozen. Raw
+      // singles get repriced from TCGplayer during the import itself.
+      priceSource: (sealed || grade) ? 'collectr' : 'tcgplayer',
+      addedAt: date,
+      priceUpdated: date
+    });
+  }
+  return { kept, skipped };
+}
+
+/* Resolve raw singles against the catalog for artwork, a stable id, and a
+   live price. Sealed and graded rows pass straight through untouched. */
+async function enrichImport(rows, onProgress) {
+  const targets = rows.filter(r => r.kind === 'single' && !r.grade);
+  let done = 0;
+  for (const r of targets) {
+    try {
+      const card = await resolve(r);
+      if (card) {
+        r.cardId = card.id;
+        r.name = card.name || r.name;
+        r.setName = card.set?.name || r.setName;
+        r.number = card.number || r.number;
+        r.printedTotal = card.set?.printedTotal || r.printedTotal;
+        r.image = card.images?.small || '';
+        const p = priceOf(card, r.variant);
+        if (p) { r.priceUsd = p.usd; r.printing = p.printing; r.priceUpdated = Date.now(); }
+      }
+    } catch { /* leave the Collectr figure in place rather than blanking it */ }
+    onProgress(++done, targets.length);
+  }
+  return rows;
+}
+
+/* Merge rows into the collection, stacking onto anything that matches. */
+async function commitRows(rows) {
+  const existing = await DB.all();
+  const byKey = new Map(existing.map(r => [stackKey(r), r]));
+  let added = 0, stacked = 0;
+
+  for (const r of rows) {
+    const hit = (r.kind === 'sealed' || r.cardId) ? byKey.get(stackKey(r)) : null;
+    if (hit) {
+      hit.qty = (hit.qty || 1) + (r.qty || 1);
+      if (r.priceUsd) { hit.priceUsd = r.priceUsd; hit.priceUpdated = Date.now(); }
+      await DB.put(hit);
+      stacked++;
+    } else {
+      const rec = { ...r };
+      delete rec.matched; delete rec.confidence; delete rec.error;
+      rec.id = await DB.put(rec);
+      if (r.kind === 'sealed' || r.cardId) byKey.set(stackKey(rec), rec);
+      added++;
+    }
+  }
+  return { added, stacked };
+}
+
 /* ----------------------------------------------------------------- views */
 
 let TAB = 'collection';
 let PENDING = [];
+let IMPORT = null;
+let FILTER = { q: '', kind: 'all', sort: 'updated' };
 
 async function render() {
   const v = $('#view');
@@ -360,7 +568,7 @@ async function render() {
   if (TAB === 'collection') await viewCollection(v);
   if (TAB === 'scan') await viewScan(v);
   if (TAB === 'trade') await viewTrade(v);
-  if (TAB === 'settings') viewSettings(v);
+  if (TAB === 'settings') await viewSettings(v);
   await updateTotals();
 }
 
@@ -373,52 +581,122 @@ async function updateTotals() {
 
 /* ---- collection ---- */
 
+function applyFilter(cards) {
+  const q = FILTER.q.trim().toLowerCase();
+  let out = cards.filter(c => {
+    if (FILTER.kind === 'singles' && c.kind === 'sealed') return false;
+    if (FILTER.kind === 'sealed' && c.kind !== 'sealed') return false;
+    if (FILTER.kind === 'trade' && tradeOf(c) < 1) return false;
+    if (!q) return true;
+    return (c.name + ' ' + (c.setName || '') + ' ' + (c.number || '')).toLowerCase().includes(q);
+  });
+  const sorts = {
+    updated: (a, b) => (b.priceUpdated || b.addedAt || 0) - (a.priceUpdated || a.addedAt || 0),
+    added:   (a, b) => (b.addedAt || 0) - (a.addedAt || 0),
+    value:   (a, b) => valueOf(b) * (b.qty || 1) - valueOf(a) * (a.qty || 1),
+    name:    (a, b) => a.name.localeCompare(b.name)
+  };
+  return out.sort(sorts[FILTER.sort] || sorts.updated);
+}
+
 async function viewCollection(v) {
-  const cards = (await DB.all()).sort((a, b) => b.addedAt - a.addedAt);
+  const cards = await DB.all();
 
   if (!cards.length) {
     v.appendChild(el('div', 'text-center py-20 fade-up', `
       <p class="font-display text-xl mb-2">Nothing logged yet</p>
-      <p class="text-sm text-muted mb-6 max-w-xs mx-auto">Open a pack, take a photo, and every card lands here with its market price.</p>
+      <p class="text-sm text-muted mb-6 max-w-xs mx-auto">Open a pack, take a photo, and every card lands here with its market price. Already tracking elsewhere? Import a CSV from Settings.</p>
       <button id="goScan" class="bg-maroon px-6 py-3 rounded font-display tracking-wide">Scan your first card</button>`));
     $('#goScan').onclick = () => go('scan');
     return;
   }
 
-  const bar = el('div', 'flex items-center justify-between mb-4');
-  bar.appendChild(el('p', 'text-sm text-muted', `${cards.length} card${cards.length > 1 ? 's' : ''} logged`));
-  const refresh = el('button', 'text-xs uppercase tracking-[0.14em] text-gold border border-gold/40 px-3 py-1.5 rounded', 'Refresh prices');
-  refresh.onclick = () => refreshPrices(refresh);
-  bar.appendChild(refresh);
-  v.appendChild(bar);
+  const KINDS = [['all', 'All'], ['singles', 'Singles'], ['sealed', 'Sealed'], ['trade', 'Trade']];
+  const controls = el('div', 'mb-4 fade-up');
+  controls.innerHTML = `
+    <input id="q" value="${esc(FILTER.q)}" placeholder="Search name, set or number" enterkeyhint="search"
+      class="w-full bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm mb-2.5">
+    <div class="flex gap-1.5 mb-2.5">
+      ${KINDS.map(([k, label]) => `<button data-kind="${k}"
+        class="kind flex-1 text-[10px] uppercase tracking-[0.1em] py-1.5 rounded border ${FILTER.kind === k ? 'bg-maroon border-maroon' : 'border-muted/30 text-muted'}">${label}</button>`).join('')}
+    </div>
+    <div class="flex items-center gap-2">
+      <select id="sort" class="bg-ink2 text-xs rounded px-2 py-1.5 border border-muted/30 flex-1">
+        <option value="updated"${FILTER.sort === 'updated' ? ' selected' : ''}>Recently updated</option>
+        <option value="added"${FILTER.sort === 'added' ? ' selected' : ''}>Recently added</option>
+        <option value="value"${FILTER.sort === 'value' ? ' selected' : ''}>Highest value</option>
+        <option value="name"${FILTER.sort === 'name' ? ' selected' : ''}>Name</option>
+      </select>
+      <button id="refresh" class="text-xs uppercase tracking-[0.14em] text-gold border border-gold/40 px-3 py-1.5 rounded">Refresh prices</button>
+    </div>`;
+  v.appendChild(controls);
 
+  const count = el('p', 'text-sm text-muted mb-3');
   const grid = el('div', 'grid grid-cols-2 gap-3');
-  cards.forEach(c => grid.appendChild(cardTile(c)));
-  v.appendChild(grid);
+  v.append(count, grid);
+
+  const paint = () => {
+    const shown = applyFilter(cards);
+    const copies = shown.reduce((s, c) => s + (c.qty || 1), 0);
+    const worth = shown.reduce((s, c) => s + valueOf(c) * (c.qty || 1), 0);
+    count.textContent = shown.length
+      ? `${copies} item${copies === 1 ? '' : 's'} Â· ${qar(worth)}`
+      : 'Nothing matches that.';
+    grid.innerHTML = '';
+    shown.forEach(c => grid.appendChild(cardTile(c)));
+  };
+  paint();
+
+  // Only the grid repaints on a keystroke, so the input keeps focus and the
+  // caret does not jump.
+  let debounce;
+  const input = $('#q', controls);
+  input.oninput = e => {
+    FILTER.q = e.target.value;
+    clearTimeout(debounce);
+    debounce = setTimeout(paint, 200);
+  };
+  $('#sort', controls).onchange = e => { FILTER.sort = e.target.value; paint(); };
+  controls.querySelectorAll('.kind').forEach(b => b.onclick = () => {
+    FILTER.kind = b.dataset.kind;
+    render();
+  });
+  $('#refresh', controls).onclick = e => refreshPrices(e.currentTarget);
 }
 
 function cardTile(c) {
   const qty = c.qty || 1;
   const tq = tradeOf(c);
+  const sealed = c.kind === 'sealed';
+  const frozen = c.priceSource === 'collectr';
   const t = el('div', 'bg-ink2 rounded overflow-hidden fade-up');
+
+  const sub = sealed
+    ? esc(c.setName || 'Sealed')
+    : `${esc(c.setName)} ${c.number ? esc(c.number) : ''}${c.printedTotal ? '/' + esc(c.printedTotal) : ''}`;
+  const tags = [
+    c.grade ? esc(c.grade) : '',
+    sealed ? 'Sealed' : esc(c.condition || 'NM'),
+    qty > 1 ? 'x' + qty : ''
+  ].filter(Boolean).join(' Â· ');
+
   t.innerHTML = `
-    <div class="card-ratio bg-maroonD/40">
-      <img src="${esc(c.image)}" alt="${esc(c.name)}" class="w-full h-full object-cover" loading="lazy">
-    </div>
+    <div class="card-ratio">${thumb(c, 'w-full h-full')}</div>
     <div class="p-2.5">
       <p class="font-display text-sm leading-tight truncate">${esc(c.name)}</p>
-      <p class="text-[11px] text-muted truncate">${esc(c.setName)} ${c.number ? esc(c.number) : ''}${c.printedTotal ? '/' + esc(c.printedTotal) : ''}</p>
+      <p class="text-[11px] text-muted truncate">${sub}</p>
       <p class="text-gold font-display text-base tabular mt-1.5">${qar(valueOf(c))}</p>
-      <p class="text-[10px] text-muted tabular">${usd(valueOf(c))} · ${esc(c.condition || 'NM')}${c.qty > 1 ? ' · x' + c.qty : ''}</p>
+      <p class="text-[10px] text-muted tabular truncate">${usd(valueOf(c))} Â· ${tags}</p>
+      ${frozen ? `<p class="text-[10px] text-sand/60 mt-0.5">Price from Collectr, not auto-updated</p>` : ''}
       <div class="flex gap-1.5 mt-2">
         ${qty > 1 ? `
-          <button class="tminus w-7 text-sm leading-none py-1.5 rounded border ${tq ? 'border-maroon' : 'border-muted/30 text-muted'}">−</button>
+          <button class="tminus w-7 text-sm leading-none py-1.5 rounded border ${tq ? 'border-maroon' : 'border-muted/30 text-muted'}">â</button>
           <span class="flex-1 text-[10px] uppercase tracking-[0.1em] py-1.5 text-center tabular ${tq ? 'text-gold' : 'text-muted'}">${tq ? tq + '/' + qty + ' trade' : 'Keep all'}</span>
           <button class="tplus w-7 text-sm leading-none py-1.5 rounded border ${tq < qty ? 'border-maroon' : 'border-muted/30 text-muted'}">+</button>
         ` : `
           <button class="trade flex-1 text-[10px] uppercase tracking-[0.1em] py-1.5 rounded border ${tq ? 'bg-maroon border-maroon' : 'border-muted/30 text-muted'}">${tq ? 'For trade' : 'Keep'}</button>
         `}
-        <button class="del text-[10px] px-2 py-1.5 rounded border border-muted/30 text-muted">✕</button>
+        <button class="del text-[10px] px-2 py-1.5 rounded border border-muted/30 text-muted">â</button>
       </div>
     </div>`;
 
@@ -445,7 +723,13 @@ function cardTile(c) {
 }
 
 async function refreshPrices(btn) {
-  const cards = (await DB.all()).filter(c => c.cardId);
+  const all = await DB.all();
+  const cards = all.filter(canRefresh);
+  const held = all.length - cards.length;
+  if (!cards.length) {
+    toast('Nothing to refresh. Sealed and graded prices stay as imported.');
+    return;
+  }
   btn.disabled = true;
   let n = 0;
   for (const c of cards) {
@@ -453,11 +737,11 @@ async function refreshPrices(btn) {
     try {
       const hits = await ptcgQuery(`id:"${c.cardId}"`, true);
       const p = priceOf(hits[0], c.variant);
-      if (p) { c.priceUsd = p.usd; c.priceUpdated = Date.now(); await DB.put(c); }
+      if (p) { c.priceUsd = p.usd; c.printing = p.printing; c.priceUpdated = Date.now(); await DB.put(c); }
     } catch { /* keep the old price rather than blanking it */ }
   }
   btn.disabled = false;
-  toast('Prices updated');
+  toast(held ? `${cards.length} updated, ${held} held` : `${cards.length} updated`);
   render();
 }
 
@@ -468,12 +752,12 @@ async function viewScan(v) {
 
   v.innerHTML = `
     <div class="fade-up">
-      <p class="text-sm text-muted mb-6">Two ways in. Use precision for anything you care about, bulk for everything else.</p>
+      <p class="text-sm text-muted mb-6">The camera is for new cards. Anything already in a binder should come in through Import in Settings.</p>
 
       <label class="block bg-maroon rounded p-5 mb-3 active:opacity-90">
         <input type="file" accept="image/*" capture="environment" class="hidden" id="single">
         <div class="flex items-center gap-4">
-          <span class="text-3xl">◎</span>
+          <span class="text-3xl">â</span>
           <div>
             <p class="font-display text-lg leading-tight">Precision</p>
             <p class="text-xs opacity-80">One card, one photo. Highest accuracy.</p>
@@ -484,10 +768,10 @@ async function viewScan(v) {
       <label class="block bg-ink2 border border-maroonD rounded p-5 active:opacity-90">
         <input type="file" accept="image/*" capture="environment" class="hidden" id="bulk">
         <div class="flex items-center gap-4">
-          <span class="text-3xl">▦</span>
+          <span class="text-3xl">â¦</span>
           <div>
             <p class="font-display text-lg leading-tight">Bulk grid</p>
-            <p class="text-xs text-muted">Lay the pack out, one photo, all cards at once.</p>
+            <p class="text-xs text-muted">Loose cards spread out, one photo, all at once.</p>
           </div>
         </div>
       </label>
@@ -496,8 +780,9 @@ async function viewScan(v) {
 
       <p class="text-xs uppercase tracking-[0.16em] text-muted mb-2">For bulk shots</p>
       <ul class="text-sm text-muted space-y-1.5 list-none">
-        <li>Dark, plain surface. A closed binder works.</li>
-        <li>Cards not touching, roughly square to the frame.</li>
+        <li>Loose cards only. Cards still in binder pockets cannot be separated.</li>
+        <li>Dark, plain surface. A closed binder cover works well.</li>
+        <li>Leave a finger's gap between cards. Touching cards read as one shape.</li>
         <li>Even light, no flash glare across the foils.</li>
       </ul>
 
@@ -522,7 +807,7 @@ async function runScan(file, isBulk) {
       crops = await cropCards(canvas);
       if (!crops.length) {
         status.textContent = '';
-        toast('No cards found. Try a darker background with more gaps.', 'bad');
+        toast('No cards found. Loose cards on a dark surface, with gaps.', 'bad');
         return;
       }
       status.textContent = `Found ${crops.length}`;
@@ -530,7 +815,18 @@ async function runScan(file, isBulk) {
       crops = [canvas];
     }
 
-    PENDING = await processCrops(crops, status);
+    const found = await processCrops(crops, status);
+
+    // Tell him what he already owns while the card is still in his hand,
+    // rather than in a toast after saving.
+    const owned = await DB.all();
+    const byKey = new Map(owned.map(r => [stackKey(r), r]));
+    found.forEach(c => {
+      const hit = c.cardId ? byKey.get(stackKey({ ...c, condition: c.condition || 'NM' })) : null;
+      c.existingQty = hit ? (hit.qty || 1) : 0;
+    });
+
+    PENDING = found;
     status.textContent = '';
     render();
   } catch (e) {
@@ -555,11 +851,12 @@ function viewReview(v) {
     const low = !c.matched || (c.confidence ?? 1) < 0.75;
     const row = el('div', `flex gap-3 bg-ink2 rounded p-3 mb-2.5 fade-up ${low ? 'border border-gold/50' : ''}`);
     row.innerHTML = `
-      <img src="${esc(c.image)}" class="w-14 rounded object-cover card-ratio bg-maroonD/40" alt="">
+      ${thumb(c, 'w-14 rounded card-ratio shrink-0')}
       <div class="flex-1 min-w-0">
         <p class="font-display text-sm truncate">${esc(c.name)}</p>
-        <p class="text-[11px] text-muted truncate">${esc(c.setName)} ${esc(c.number)}${c.printedTotal ? '/' + esc(c.printedTotal) : ''} · ${esc(c.printing || c.variant)}</p>
+        <p class="text-[11px] text-muted truncate">${esc(c.setName)} ${esc(c.number)}${c.printedTotal ? '/' + esc(c.printedTotal) : ''} Â· ${esc(c.printing || c.variant)}</p>
         ${low ? `<p class="text-[11px] text-gold mt-0.5">${c.matched ? 'Low confidence, worth a look' : 'No catalog match'}</p>` : ''}
+        ${c.existingQty ? `<p class="text-[11px] text-sand/70 mt-0.5">Already have ${c.existingQty}</p>` : ''}
         <div class="flex items-center gap-2 mt-2">
           <select class="cond bg-ink text-xs rounded px-2 py-1 border border-muted/30">
             ${CONDITIONS.map(k => `<option ${k === (c.condition || 'NM') ? 'selected' : ''}>${k}</option>`).join('')}
@@ -577,35 +874,16 @@ function viewReview(v) {
   const save = el('button', 'flex-1 bg-maroon py-3 rounded font-display tracking-wide', 'Add to collection');
   const cancel = el('button', 'px-5 py-3 rounded border border-muted/30 text-muted text-sm', 'Discard');
   save.onclick = async () => {
-    const rows = await DB.all();
-    const byKey = new Map(rows.filter(r => r.cardId).map(r => [stackKey(r), r]));
-    let stacked = 0;
-
-    for (const c of PENDING) {
-      const rec = {
-        cardId: c.cardId, name: c.name, setName: c.setName, number: c.number,
-        printedTotal: c.printedTotal, image: c.image, variant: c.variant,
-        printing: c.printing, priceUsd: c.priceUsd, condition: c.condition || 'NM',
-        qty: 1, tradeQty: 0, addedAt: Date.now(), priceUpdated: Date.now()
-      };
-      // No catalog id means the card was never identified, so copies of it
-      // can't be told apart. Those stay separate rows rather than risk
-      // merging two different unknown cards into one stack.
-      const hit = c.cardId ? byKey.get(stackKey(rec)) : null;
-      if (hit) {
-        hit.qty = (hit.qty || 1) + 1;
-        hit.priceUsd = rec.priceUsd || hit.priceUsd;
-        hit.priceUpdated = Date.now();
-        await DB.put(hit);
-        stacked++;
-      } else {
-        rec.id = await DB.put(rec);
-        // Seed the map so later copies in this same batch stack onto it.
-        if (c.cardId) byKey.set(stackKey(rec), rec);
-      }
-    }
-
-    toast(stacked ? `${PENDING.length} added, ${stacked} stacked` : `${PENDING.length} added`);
+    const rows = PENDING.map(c => ({
+      kind: 'single',
+      cardId: c.cardId, name: c.name, setName: c.setName, number: c.number,
+      printedTotal: c.printedTotal, image: c.image, variant: c.variant,
+      printing: c.printing, priceUsd: c.priceUsd, priceSource: 'tcgplayer',
+      condition: c.condition || 'NM', grade: '', era: '',
+      qty: 1, tradeQty: 0, addedAt: Date.now(), priceUpdated: Date.now()
+    }));
+    const { stacked } = await commitRows(rows);
+    toast(stacked ? `${rows.length} added, ${stacked} stacked` : `${rows.length} added`);
     PENDING = [];
     go('collection');
   };
@@ -621,7 +899,7 @@ function askPrice(c) {
 }
 
 async function viewTrade(v) {
-  const cards = (await DB.all()).filter(c => tradeOf(c) > 0).sort((a, b) => b.priceUsd - a.priceUsd);
+  const cards = (await DB.all()).filter(c => tradeOf(c) > 0).sort((a, b) => valueOf(b) - valueOf(a));
   const copies = cards.reduce((s, c) => s + tradeOf(c), 0);
 
   if (!cards.length) {
@@ -634,7 +912,7 @@ async function viewTrade(v) {
   const total = cards.reduce((s, c) => s + askPrice(c) * tradeOf(c), 0);
   const head = el('div', 'mb-4 fade-up');
   head.innerHTML = `
-    <p class="font-display text-xl">${copies} on the shelf${copies !== cards.length ? ` · ${cards.length} listing${cards.length === 1 ? '' : 's'}` : ''}</p>
+    <p class="font-display text-xl">${copies} on the shelf${copies !== cards.length ? ` Â· ${cards.length} listing${cards.length === 1 ? '' : 's'}` : ''}</p>
     <p class="text-gold font-display text-2xl tabular">${Math.round(total).toLocaleString()} QAR</p>
     <p class="text-xs text-muted">Asks include your ${CFG.premium || 0}% local premium.</p>`;
   v.appendChild(head);
@@ -643,9 +921,12 @@ async function viewTrade(v) {
   post.onclick = async () => {
     const lines = cards.map(c => {
       const n = tradeOf(c);
-      return `${c.name} ${c.number}${c.printedTotal ? '/' + c.printedTotal : ''}` +
-        `${c.variant === 'reverse' ? ' (RH)' : c.variant === 'holo' ? ' (Holo)' : ''}` +
-        ` [${c.condition || 'NM'}]${n > 1 ? ` x${n}` : ''}` +
+      const id = c.kind === 'sealed'
+        ? ''
+        : ` ${c.number}${c.printedTotal ? '/' + c.printedTotal : ''}`;
+      const foil = c.variant === 'reverse' ? ' (RH)' : c.variant === 'holo' ? ' (Holo)' : '';
+      const state = c.grade ? ` [${c.grade}]` : c.kind === 'sealed' ? ' [Sealed]' : ` [${c.condition || 'NM'}]`;
+      return `${c.name}${id}${foil}${state}${n > 1 ? ` x${n}` : ''}` +
         ` - ${Math.round(askPrice(c)).toLocaleString()} QAR${n > 1 ? ' each' : ''}`;
     });
     const text = `FOR TRADE / SALE - Doha\n\n${lines.join('\n')}\n\nPrices track TCGplayer market. Open to trades.`;
@@ -660,13 +941,14 @@ async function viewTrade(v) {
 
   cards.forEach(c => {
     const row = el('div', 'flex items-center gap-3 bg-ink2 rounded p-3 mb-2 fade-up');
+    const state = c.grade || (c.kind === 'sealed' ? 'Sealed' : c.condition || 'NM');
     row.innerHTML = `
-      <img src="${esc(c.image)}" class="w-11 rounded object-cover card-ratio" alt="">
+      ${thumb(c, 'w-11 rounded card-ratio shrink-0')}
       <div class="flex-1 min-w-0">
         <p class="font-display text-sm truncate">${esc(c.name)}</p>
-        <p class="text-[11px] text-muted truncate">${esc(c.setName)} · ${esc(c.condition || 'NM')}${tradeOf(c) > 1 ? ' · x' + tradeOf(c) : ''}</p>
+        <p class="text-[11px] text-muted truncate">${esc(c.setName)} Â· ${esc(state)}${tradeOf(c) > 1 ? ' Â· x' + tradeOf(c) : ''}</p>
       </div>
-      <div class="text-right">
+      <div class="text-right shrink-0">
         <p class="text-gold font-display tabular">${Math.round(askPrice(c)).toLocaleString()}</p>
         <p class="text-[10px] text-muted">QAR${tradeOf(c) > 1 ? ' ea' : ''}</p>
       </div>`;
@@ -676,7 +958,9 @@ async function viewTrade(v) {
 
 /* ---- settings ---- */
 
-function viewSettings(v) {
+async function viewSettings(v) {
+  if (IMPORT) return viewImport(v);
+
   v.innerHTML = `
     <div class="fade-up space-y-5">
       <div>
@@ -716,9 +1000,16 @@ function viewSettings(v) {
 
       <div class="serrate serrate-thin"></div>
 
-      ${installPrompt ? `<button id="s-install" class="w-full bg-maroonD py-3 rounded font-display tracking-wide">Install to home screen</button>` : ''}
+      <p class="text-xs uppercase tracking-[0.16em] text-muted">Collection</p>
+      <label class="block w-full bg-maroonD py-3 rounded font-display tracking-wide text-center active:opacity-90">
+        <input type="file" accept=".csv,text/csv" class="hidden" id="s-import">
+        Import a CSV
+      </label>
+      <p class="text-[11px] text-muted -mt-3">Takes a Collectr export. Watchlist entries are left out, and sealed and graded prices come across as they are.</p>
 
       <button id="s-export" class="w-full border border-muted/30 text-muted py-3 rounded text-sm">Export collection as CSV</button>
+
+      ${installPrompt ? `<button id="s-install" class="w-full border border-gold/40 text-gold py-3 rounded text-sm">Install to home screen</button>` : ''}
     </div>`;
 
   const install = $('#s-install');
@@ -740,12 +1031,32 @@ function viewSettings(v) {
     render();
   };
 
+  $('#s-import').onchange = async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const { kept, skipped } = readCollectr(text);
+      if (!kept.length) {
+        toast('Nothing importable in that file.', 'bad');
+        return;
+      }
+      IMPORT = { rows: kept, skipped, stage: 'review', done: 0, total: 0 };
+      render();
+    } catch (err) {
+      toast('Could not read that file: ' + err.message, 'bad');
+    }
+  };
+
   $('#s-export').onclick = async () => {
     const cards = await DB.all();
-    const head = ['name', 'set', 'number', 'printedTotal', 'variant', 'condition', 'qty', 'priceUsd', 'priceQar', 'tradeQty'];
+    const head = ['kind', 'name', 'set', 'number', 'printedTotal', 'variant', 'era',
+                  'grade', 'condition', 'qty', 'priceUsd', 'priceQar', 'priceSource', 'tradeQty'];
     const rows = cards.map(c => [
-      c.name, c.setName, c.number, c.printedTotal, c.variant, c.condition, c.qty || 1,
-      (c.priceUsd || 0).toFixed(2), Math.round((c.priceUsd || 0) * CFG.qarRate), tradeOf(c)
+      c.kind || 'single', c.name, c.setName, c.number, c.printedTotal, c.variant, c.era || '',
+      c.grade || '', c.condition || '', c.qty || 1,
+      (c.priceUsd || 0).toFixed(2), Math.round((c.priceUsd || 0) * CFG.qarRate),
+      c.priceSource || 'tcgplayer', tradeOf(c)
     ].map(x => `"${String(x ?? '').replace(/"/g, '""')}"`).join(','));
     const blob = new Blob([[head.join(','), ...rows].join('\n')], { type: 'text/csv' });
     const a = el('a');
@@ -754,6 +1065,84 @@ function viewSettings(v) {
     a.click();
     URL.revokeObjectURL(a.href);
   };
+}
+
+/* ---- import review ---- */
+
+function viewImport(v) {
+  const { rows, skipped, stage, done, total } = IMPORT;
+  const sealed = rows.filter(r => r.kind === 'sealed');
+  const graded = rows.filter(r => r.kind === 'single' && r.grade);
+  const raw    = rows.filter(r => r.kind === 'single' && !r.grade);
+  const worth  = g => g.reduce((s, r) => s + r.priceUsd * r.qty, 0);
+  const copies = g => g.reduce((s, r) => s + r.qty, 0);
+
+  const line = (label, g, note) => `
+    <div class="flex items-baseline justify-between py-2 border-b border-maroonD/60">
+      <div>
+        <p class="text-sm">${label}</p>
+        ${note ? `<p class="text-[11px] text-muted">${note}</p>` : ''}
+      </div>
+      <div class="text-right shrink-0 pl-3">
+        <p class="text-gold font-display tabular">${qar(worth(g))}</p>
+        <p class="text-[10px] text-muted tabular">${copies(g)} item${copies(g) === 1 ? '' : 's'}</p>
+      </div>
+    </div>`;
+
+  const head = el('div', 'fade-up');
+  head.innerHTML = `
+    <p class="font-display text-xl mb-1">Import review</p>
+    <p class="text-sm text-muted mb-4">Nothing is saved until you confirm.</p>
+    ${line('Raw singles', raw, 'Repriced from TCGplayer during import')}
+    ${line('Sealed product', sealed, 'Collectr price, frozen and not auto-updated')}
+    ${line('Graded cards', graded, 'Collectr price, locked out of refresh')}
+    <div class="flex items-baseline justify-between py-3">
+      <p class="font-display">Total</p>
+      <p class="text-gold font-display text-xl tabular">${qar(worth(rows))}</p>
+    </div>
+    ${skipped.length ? `
+      <div class="bg-ink2 rounded p-3 mb-4">
+        <p class="text-[11px] uppercase tracking-[0.14em] text-gold mb-1.5">${skipped.length} row${skipped.length === 1 ? '' : 's'} left out</p>
+        ${skipped.slice(0, 6).map(s => `<p class="text-[11px] text-muted truncate">${esc(s.name)} Â· ${esc(s.why)}</p>`).join('')}
+        ${skipped.length > 6 ? `<p class="text-[11px] text-muted">and ${skipped.length - 6} more</p>` : ''}
+      </div>` : ''}`;
+  v.appendChild(head);
+
+  if (stage === 'running') {
+    const pct = total ? Math.round(done / total * 100) : 0;
+    const prog = el('div', 'mt-2');
+    prog.innerHTML = `
+      <div class="h-1.5 bg-ink2 rounded overflow-hidden mb-2">
+        <div class="h-full bg-maroon" style="width:${pct}%"></div>
+      </div>
+      <p class="text-sm text-gold text-center">Matching singles ${done} of ${total}</p>
+      <p class="text-[11px] text-muted text-center mt-1">Leave this open. Sealed items need no lookup.</p>`;
+    v.appendChild(prog);
+    return;
+  }
+
+  const actions = el('div', 'flex gap-3 mt-4');
+  const run = el('button', 'flex-1 bg-maroon py-3 rounded font-display tracking-wide', `Import ${copies(rows)} items`);
+  const cancel = el('button', 'px-5 py-3 rounded border border-muted/30 text-muted text-sm', 'Cancel');
+  run.onclick = async () => {
+    IMPORT.stage = 'running';
+    IMPORT.total = raw.length;
+    render();
+    await enrichImport(rows, (d, t) => {
+      IMPORT.done = d; IMPORT.total = t;
+      const bar = $('#view .bg-maroon[style]');
+      const label = $('#view .text-gold.text-center');
+      if (bar) bar.style.width = Math.round(d / t * 100) + '%';
+      if (label) label.textContent = `Matching singles ${d} of ${t}`;
+    });
+    const { added, stacked } = await commitRows(rows);
+    IMPORT = null;
+    toast(stacked ? `${added} imported, ${stacked} stacked` : `${added} imported`);
+    go('collection');
+  };
+  cancel.onclick = () => { IMPORT = null; render(); };
+  actions.append(run, cancel);
+  v.appendChild(actions);
 }
 
 /* ------------------------------------------------------------------ boot */
@@ -767,6 +1156,11 @@ function go(tab, push = true) {
   if (TAB === 'scan' && PENDING.length && tab !== 'scan') {
     if (!confirm(discardPrompt())) return;
     PENDING = [];
+  }
+  if (TAB === 'settings' && IMPORT && tab !== 'settings') {
+    if (IMPORT.stage === 'running') { toast('Import is still running.'); return; }
+    if (!confirm('Cancel the import?')) return;
+    IMPORT = null;
   }
   TAB = tab;
   if (push) history.pushState({ tab }, '', '#' + tab);
@@ -784,6 +1178,16 @@ window.addEventListener('popstate', e => {
     if (!confirm(discardPrompt())) return;
     PENDING = [];
     TAB = 'scan';
+    render();
+    return;
+  }
+  // Same treatment for an import that has not been committed.
+  if (IMPORT) {
+    history.pushState({ tab: 'settings' }, '', '#settings');
+    if (IMPORT.stage === 'running') { toast('Import is still running.'); return; }
+    if (!confirm('Cancel the import?')) return;
+    IMPORT = null;
+    TAB = 'settings';
     render();
     return;
   }
