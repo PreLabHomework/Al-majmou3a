@@ -139,9 +139,28 @@ const canvasToB64 = (c, q = 0.82) => c.toDataURL('image/jpeg', q).split(',')[1];
 /* Artwork for a row, or a lettered placeholder for sealed product and
    anything that never resolved to a catalog image. */
 function thumb(c, cls) {
-  if (c.image) return `<img src="${esc(c.image)}" alt="${esc(c.name)}" class="${cls} object-cover" loading="lazy">`;
+  if (c.image) {
+    // Catalog artwork is already a portrait card scan and fills the frame.
+    // A camera capture is whatever shape the phone took, often landscape with
+    // the card sideways, so cropping it to a card shape hides the card.
+    const fit = c.image.startsWith('data:') ? 'object-contain' : 'object-cover';
+    return `<img src="${esc(c.image)}" alt="${esc(c.name)}" class="${cls} ${fit}" loading="lazy">`;
+  }
   const glyph = c.kind === 'sealed' ? 'â§' : '?';
   return `<div class="${cls} bg-maroonD/40 flex items-center justify-center text-sand/50 text-2xl">${glyph}</div>`;
+}
+
+/* Cards are portrait. A landscape photo usually means the phone was held
+   sideways, so a failed read is worth one more attempt rotated. */
+function rotateCanvas(src, deg = 90) {
+  const out = el('canvas');
+  out.width = src.height;
+  out.height = src.width;
+  const ctx = out.getContext('2d');
+  ctx.translate(out.width / 2, out.height / 2);
+  ctx.rotate(deg * Math.PI / 180);
+  ctx.drawImage(src, -src.width / 2, -src.height / 2);
+  return out;
 }
 
 /* ---------------------------------------------------------------- vision */
@@ -161,7 +180,7 @@ Rules:
 If the image is not a trading card, return {"name":"","number":"","printedTotal":"","setHint":"","language":"","variant":"normal","confidence":0}`;
 
 async function identify(b64) {
-  if (!CFG.workerUrl) throw new Error('No scanner endpoint set. Open Settings.');
+  if (!CFG.workerUrl) throw new Error('No scanner endpoint set. Add the Worker URL in Settings.');
   const r = await fetch(CFG.workerUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-App-Secret': CFG.workerSecret },
@@ -177,12 +196,17 @@ async function identify(b64) {
       }]
     })
   });
-  if (!r.ok) throw new Error('Scanner returned ' + r.status);
+  if (!r.ok) {
+    const detail = r.status === 401 ? 'Scanner rejected the shared secret (401). Check Settings.'
+      : r.status === 403 ? 'Scanner refused the request (403). Check ALLOWED_ORIGIN on the Worker.'
+      : `Scanner returned ${r.status}.`;
+    throw new Error(detail);
+  }
   const data = await r.json();
   const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
   const clean = text.replace(/```json|```/g, '').trim();
   try { return JSON.parse(clean); }
-  catch { throw new Error('Could not read that card'); }
+  catch { throw new Error('Scanner replied but not in the expected format.'); }
 }
 
 /* --------------------------------------------------------------- catalog */
@@ -445,36 +469,65 @@ async function cropCards(canvas) {
 
 /* ------------------------------------------------------------ scan flow */
 
+/* One read attempt, retried rotated when the photo is landscape. */
+async function readCard(canvas) {
+  let read = await identify(canvasToB64(canvas));
+  if (!read.name && !read.number && canvas.width > canvas.height) {
+    read = await identify(canvasToB64(rotateCanvas(canvas, 90)));
+    read.rotated = true;
+  }
+  return read;
+}
+
+/* Turn one crop into a review row. Kept separate from the batch loop so a
+   single row can be retried from the review screen without rescanning. */
+async function readOne(canvas) {
+  const preview = canvas.toDataURL('image/jpeg', 0.6);
+  try {
+    const read = await readCard(canvas);
+    if (!read.name && !read.number) {
+      return {
+        kind: 'single', name: 'Not recognised', image: preview, canvas,
+        matched: false, priceUsd: 0, confidence: 0,
+        error: 'The scanner read the photo but found no card in it.'
+      };
+    }
+    const card = await resolve(read);
+    const price = card ? priceOf(card, read.variant) : null;
+    return {
+      kind: 'single',
+      cardId: card?.id || null,
+      name: card?.name || read.name || 'Unknown card',
+      setName: card?.set?.name || read.setHint || '',
+      number: card?.number || read.number || '',
+      printedTotal: card?.set?.printedTotal || read.printedTotal || '',
+      rarity: card?.rarity || '',
+      image: card?.images?.small || preview,
+      canvas,
+      variant: read.variant || 'normal',
+      printing: price?.printing || '',
+      priceUsd: price?.usd || 0,
+      priceSource: 'tcgplayer',
+      confidence: read.confidence ?? 0,
+      matched: !!card
+    };
+  } catch (e) {
+    // Keep the real message. "Could not read" on its own gives no way to tell
+    // a missing Worker from a bad secret from an unclear photo.
+    return {
+      kind: 'single', name: 'Could not read', image: preview, canvas,
+      matched: false, priceUsd: 0, error: e.message
+    };
+  }
+}
+
 async function processCrops(canvases, statusEl) {
   const results = [];
   let done = 0;
   const step = () => { statusEl.textContent = `Identifying ${++done} of ${canvases.length}`; };
 
   const queue = canvases.map((c, i) => async () => {
-    try {
-      const read = await identify(canvasToB64(c));
-      if (!read.name && !read.number) { step(); return; }
-      const card = await resolve(read);
-      const price = card ? priceOf(card, read.variant) : null;
-      results[i] = {
-        kind: 'single',
-        cardId: card?.id || null,
-        name: card?.name || read.name || 'Unknown card',
-        setName: card?.set?.name || read.setHint || '',
-        number: card?.number || read.number || '',
-        printedTotal: card?.set?.printedTotal || read.printedTotal || '',
-        rarity: card?.rarity || '',
-        image: card?.images?.small || c.toDataURL('image/jpeg', 0.6),
-        variant: read.variant || 'normal',
-        printing: price?.printing || '',
-        priceUsd: price?.usd || 0,
-        priceSource: 'tcgplayer',
-        confidence: read.confidence ?? 0,
-        matched: !!card
-      };
-    } catch (e) {
-      results[i] = { kind: 'single', name: 'Could not read', error: e.message, image: c.toDataURL('image/jpeg', 0.6), matched: false, priceUsd: 0 };
-    }
+    results[i] = await readOne(c);
     step();
   });
 
@@ -655,6 +708,7 @@ async function commitRows(rows) {
     } else {
       const rec = { ...r };
       delete rec.matched; delete rec.confidence; delete rec.error;
+      delete rec.canvas; delete rec.existingQty;   // not serialisable / not state
       rec.id = await DB.put(rec);
       const k = stackKey(rec);
       if (k) byKey.set(k, rec);
@@ -669,7 +723,17 @@ async function commitRows(rows) {
 let TAB = 'collection';
 let PENDING = [];
 let IMPORT = null;
-let FILTER = { q: '', kind: 'all', sort: 'updated', set: '', rarity: '', view: 'grid' };
+let FILTER = { q: '', kind: 'all', sort: 'updated', set: '', rarity: '', view: 'large' };
+let SHEET = null;   // card open in the detail sheet, if any
+
+/* Large: three across, artwork forward. List: full details in a row.
+   Mini: six or eight across, artwork only, for scanning a big collection by
+   eye. Tapping a card in any of them opens the detail sheet. */
+const VIEWS = [
+  ['large', 'â¦', 'Large icons'],
+  ['list',  'â¤', 'Details'],
+  ['mini',  'â©', 'Small icons']
+];
 
 async function render() {
   const v = $('#view');
@@ -683,6 +747,7 @@ async function render() {
   if (TAB === 'trade') await viewTrade(v);
   if (TAB === 'settings') await viewSettings(v);
   await updateTotals();
+  if (SHEET && TAB !== 'collection') { SHEET = null; renderSheet(); }
 }
 
 async function updateTotals() {
@@ -738,8 +803,10 @@ async function viewCollection(v) {
     <div class="flex gap-2 mb-2.5">
       <input id="q" value="${esc(FILTER.q)}" placeholder="Name, number, rarity, grade" enterkeyhint="search"
         class="flex-1 min-w-0 bg-ink2 border border-maroonD rounded px-3 py-2.5 text-sm">
-      <button id="view" class="shrink-0 w-11 rounded border border-muted/30 text-muted text-lg leading-none"
-        aria-label="Switch layout">${FILTER.view === 'grid' ? 'â¤' : 'â¦'}</button>
+      <div class="shrink-0 flex rounded border border-muted/30 overflow-hidden">
+        ${VIEWS.map(([v, icon, label]) => `<button data-view="${v}" title="${label}" aria-label="${label}"
+          class="vw w-9 text-base leading-none py-2 ${FILTER.view === v ? 'bg-maroon text-bone' : 'text-muted'}">${icon}</button>`).join('')}
+      </div>
     </div>
 
     <div class="flex gap-1.5 mb-2.5">
@@ -805,9 +872,13 @@ async function viewCollection(v) {
     count.textContent = shown.length
       ? `${copies} item${copies === 1 ? '' : 's'} Â· ${qar(worth)}`
       : 'Nothing matches that.';
-    list.className = FILTER.view === 'grid' ? 'grid grid-cols-3 gap-2' : '';
+    list.className = FILTER.view === 'large' ? 'grid grid-cols-3 gap-2'
+      : FILTER.view === 'mini' ? 'grid grid-cols-6 sm:grid-cols-8 gap-1'
+      : '';
     list.innerHTML = '';
-    shown.forEach(c => list.appendChild(FILTER.view === 'grid' ? gridTile(c) : listRow(c)));
+    if (!VIEWS.some(([v]) => v === FILTER.view)) FILTER.view = 'large';
+    const build = FILTER.view === 'large' ? gridTile : FILTER.view === 'mini' ? miniTile : listRow;
+    shown.forEach(c => list.appendChild(build(c)));
   };
   paint();
 
@@ -822,7 +893,7 @@ async function viewCollection(v) {
   $('#sort', controls).onchange = e => { FILTER.sort = e.target.value; paint(); };
   $('#fset', controls).onchange = e => { FILTER.set = e.target.value; paint(); };
   $('#frar', controls).onchange = e => { FILTER.rarity = e.target.value; paint(); };
-  $('#view', controls).onclick = () => { FILTER.view = FILTER.view === 'grid' ? 'list' : 'grid'; render(); };
+  controls.querySelectorAll('.vw').forEach(b => b.onclick = () => { FILTER.view = b.dataset.view; render(); });
   controls.querySelectorAll('.kind').forEach(b => b.onclick = () => { FILTER.kind = b.dataset.kind; render(); });
   $('#refresh', controls).onclick = e => refreshPrices(e.currentTarget);
 }
@@ -838,6 +909,97 @@ async function setTradeQty(c, n) {
   delete c.forTrade;               // superseded by tradeQty
   await DB.put(c);
   render();
+  if (SHEET && SHEET.id === c.id) { SHEET = c; renderSheet(); }
+}
+
+/* Detail sheet. Reachable from every layout, which is what lets the mini
+   view work at all: the artwork alone carries no controls, so tapping has to
+   lead somewhere with them. Also the one place a card can be removed
+   regardless of which density is active. */
+function openSheet(c) {
+  SHEET = c;
+  history.pushState({ tab: TAB, sheet: 1 }, '', '#' + TAB);
+  renderSheet();
+}
+
+function closeSheet() {
+  SHEET = null;
+  renderSheet();
+}
+
+function renderSheet() {
+  let host = $('#sheet');
+  if (!SHEET) { if (host) host.remove(); return; }
+  if (!host) { host = el('div'); host.id = 'sheet'; document.body.appendChild(host); }
+
+  const c = SHEET;
+  const qty = c.qty || 1;
+  const tq = tradeOf(c);
+  const sealed = c.kind === 'sealed';
+  const frozen = c.priceSource === 'collectr';
+
+  const facts = [
+    ['Set', c.setName],
+    [sealed ? '' : 'Number', sealed ? '' : `${c.number || '?'}${c.printedTotal ? '/' + c.printedTotal : ''}`],
+    ['Rarity', c.rarity],
+    [sealed ? 'Type' : 'Condition', sealed ? 'Sealed product' : (c.grade || c.condition || 'NM')],
+    ['Printing', c.printing || (sealed ? '' : c.variant)],
+    ['Edition', c.era],
+    ['Copies', qty > 1 ? String(qty) : ''],
+    ['Price source', frozen ? 'Collectr, frozen' : c.cardId ? 'TCGplayer market' : 'Imported, no catalog match']
+  ].filter(([k, v]) => k && v);
+
+  host.innerHTML = `
+    <div class="fixed inset-0 z-[60] bg-ink/80" id="backdrop"></div>
+    <div class="fixed inset-x-0 bottom-0 z-[61] bg-ink2 rounded-t-xl max-h-[85vh] overflow-y-auto safe-b fade-up">
+      <div class="serrate"></div>
+      <div class="p-4">
+        <div class="flex gap-4">
+          <div class="w-24 shrink-0 card-ratio rounded overflow-hidden bg-ink">${thumb(c, 'w-full h-full')}</div>
+          <div class="flex-1 min-w-0">
+            <p class="font-display text-lg leading-tight">${esc(c.name)}</p>
+            <p class="text-gold font-display text-2xl tabular mt-1">${qar(valueOf(c))}</p>
+            <p class="text-[11px] text-muted tabular">${usd(valueOf(c))}${qty > 1 ? ` each Â· ${qar(valueOf(c) * qty)} total` : ''}</p>
+          </div>
+        </div>
+
+        <div class="mt-4 space-y-1.5">
+          ${facts.map(([k, v]) => `
+            <div class="flex justify-between gap-4 text-[12px]">
+              <span class="text-muted shrink-0">${esc(k)}</span>
+              <span class="text-right truncate">${esc(v)}</span>
+            </div>`).join('')}
+        </div>
+
+        <div class="serrate serrate-thin my-4"></div>
+
+        <p class="text-[10px] uppercase tracking-[0.16em] text-muted mb-2">On the trade shelf</p>
+        <div class="flex items-center gap-3 mb-4">
+          <button id="sh-minus" class="w-10 py-2 rounded border ${tq ? 'border-maroon' : 'border-muted/30 text-muted'}">â</button>
+          <span class="flex-1 text-center font-display tabular ${tq ? 'text-gold' : 'text-muted'}">${tq} of ${qty}</span>
+          <button id="sh-plus" class="w-10 py-2 rounded border ${tq < qty ? 'border-maroon' : 'border-muted/30 text-muted'}">+</button>
+        </div>
+
+        <div class="flex gap-2">
+          <button id="sh-close" class="flex-1 py-3 rounded border border-muted/30 text-muted text-sm">Close</button>
+          <button id="sh-del" class="flex-1 py-3 rounded border border-maroon text-maroon text-sm">Remove${qty > 1 ? ` all ${qty}` : ''}</button>
+        </div>
+      </div>
+    </div>`;
+
+  const back = () => { if (history.state?.sheet) history.back(); else closeSheet(); };
+  $('#backdrop', host).onclick = back;
+  $('#sh-close', host).onclick = back;
+  $('#sh-minus', host).onclick = async () => { await setTradeQty(c, tq - 1); if (SHEET) renderSheet(); };
+  $('#sh-plus', host).onclick  = async () => { await setTradeQty(c, tq + 1); if (SHEET) renderSheet(); };
+  $('#sh-del', host).onclick = async () => {
+    const msg = qty > 1 ? `Remove all ${qty} copies of ${c.name}?` : `Remove ${c.name} from the collection?`;
+    if (!confirm(msg)) return;
+    await DB.del(c.id);
+    SHEET = null;
+    if (history.state?.sheet) history.back(); else { renderSheet(); render(); }
+    toast('Removed');
+  };
 }
 
 async function removeRow(c) {
@@ -853,18 +1015,32 @@ async function removeRow(c) {
 function gridTile(c) {
   const qty = c.qty || 1;
   const tq = tradeOf(c);
-  const t = el('div', 'bg-ink2 rounded overflow-hidden fade-up');
+  const t = el('div', 'bg-ink2 rounded overflow-hidden fade-up active:opacity-80');
   t.innerHTML = `
-    <div class="relative card-ratio">
+    <div class="relative card-ratio bg-ink">
       ${thumb(c, 'w-full h-full')}
-      ${qty > 1 ? `<span class="absolute top-1 right-1 bg-ink/80 text-[10px] px-1.5 py-0.5 rounded tabular">x${qty}</span>` : ''}
+      ${qty > 1 ? `<span class="absolute top-1 right-1 bg-ink/85 text-[10px] px-1.5 py-0.5 rounded tabular">x${qty}</span>` : ''}
       ${tq ? `<span class="absolute bottom-1 left-1 bg-maroon text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded">${tq > 1 ? tq + ' trade' : 'Trade'}</span>` : ''}
     </div>
     <div class="p-1.5">
       <p class="text-[11px] leading-tight truncate">${esc(c.name)}</p>
       <p class="text-gold font-display text-sm tabular leading-tight">${qar(valueOf(c))}</p>
     </div>`;
-  t.onclick = () => setTradeQty(c, tq ? 0 : qty);
+  t.onclick = () => openSheet(c);
+  return t;
+}
+
+/* Six or eight to a row, artwork only. Everything else lives in the sheet. */
+function miniTile(c) {
+  const qty = c.qty || 1;
+  const tq = tradeOf(c);
+  const t = el('div', 'relative card-ratio rounded overflow-hidden bg-ink2 fade-up active:opacity-70');
+  t.innerHTML = `
+    ${thumb(c, 'w-full h-full')}
+    ${qty > 1 ? `<span class="absolute top-0 right-0 bg-ink/85 text-[9px] px-1 rounded-bl tabular">${qty}</span>` : ''}
+    ${tq ? `<span class="absolute bottom-0 left-0 right-0 h-1 bg-maroon"></span>` : ''}`;
+  t.title = `${c.name} Â· ${qar(valueOf(c))}`;
+  t.onclick = () => openSheet(c);
   return t;
 }
 
@@ -905,6 +1081,7 @@ function listRow(c) {
     q('.trade').onclick = () => setTradeQty(c, tq ? 0 : 1);
   }
   q('.del').onclick = () => removeRow(c);
+  row.querySelector('img, div.bg-maroonD\\/40')?.addEventListener('click', () => openSheet(c));
   return row;
 }
 
@@ -1055,43 +1232,71 @@ async function runScan(file, isBulk) {
 /* ---- review ---- */
 
 function viewReview(v) {
+  const good = PENDING.filter(c => c.matched);
+  const bad = PENDING.filter(c => !c.matched);
   const total = PENDING.reduce((s, c) => s + valueOf(c), 0);
 
   const head = el('div', 'mb-4 fade-up');
   head.innerHTML = `
     <p class="font-display text-xl">${PENDING.length} card${PENDING.length > 1 ? 's' : ''} read</p>
     <p class="text-gold font-display text-2xl tabular">${qar(total)}</p>
-    <p class="text-xs text-muted">${usd(total)} at market. Check anything flagged before saving.</p>`;
+    <p class="text-xs text-muted">${usd(total)} at market.${bad.length ? ` ${bad.length} could not be identified.` : ' Check anything flagged before saving.'}</p>`;
   v.appendChild(head);
 
   PENDING.forEach((c, i) => {
-    const low = !c.matched || (c.confidence ?? 1) < 0.75;
-    const row = el('div', `flex gap-3 bg-ink2 rounded p-3 mb-2.5 fade-up ${low ? 'border border-gold/50' : ''}`);
+    const low = c.matched && (c.confidence ?? 1) < 0.75;
+    const failed = !c.matched;
+    const row = el('div', `flex gap-3 bg-ink2 rounded p-3 mb-2.5 fade-up ${failed ? 'border border-maroon' : low ? 'border border-gold/50' : ''}`);
     row.innerHTML = `
-      ${thumb(c, 'w-14 rounded card-ratio shrink-0')}
+      ${thumb(c, 'w-14 rounded card-ratio shrink-0 bg-ink')}
       <div class="flex-1 min-w-0">
         <p class="font-display text-sm truncate">${esc(c.name)}</p>
-        <p class="text-[11px] text-muted truncate">${esc(c.setName)} ${esc(c.number)}${c.printedTotal ? '/' + esc(c.printedTotal) : ''} Â· ${esc(c.printing || c.variant)}</p>
-        ${low ? `<p class="text-[11px] text-gold mt-0.5">${c.matched ? 'Low confidence, worth a look' : 'No catalog match'}</p>` : ''}
+        ${failed ? '' : `<p class="text-[11px] text-muted truncate">${esc(c.setName)} ${esc(c.number)}${c.printedTotal ? '/' + esc(c.printedTotal) : ''} Â· ${esc(c.printing || c.variant)}</p>`}
+        ${c.error ? `<p class="text-[11px] text-sand/80 mt-0.5 break-words">${esc(c.error)}</p>` : ''}
+        ${low ? `<p class="text-[11px] text-gold mt-0.5">Low confidence, worth a look</p>` : ''}
         ${c.existingQty ? `<p class="text-[11px] text-sand/70 mt-0.5">Already have ${c.existingQty}</p>` : ''}
         <div class="flex items-center gap-2 mt-2">
-          <select class="cond bg-ink text-xs rounded px-2 py-1 border border-muted/30">
-            ${CONDITIONS.map(k => `<option ${k === (c.condition || 'NM') ? 'selected' : ''}>${k}</option>`).join('')}
-          </select>
-          <span class="text-gold text-sm font-display tabular">${qar(valueOf(c))}</span>
+          ${failed ? `
+            <button class="again text-[11px] uppercase tracking-[0.12em] border border-gold/40 text-gold px-2 py-1 rounded">Try again</button>
+          ` : `
+            <select class="cond bg-ink text-xs rounded px-2 py-1 border border-muted/30">
+              ${CONDITIONS.map(k => `<option ${k === (c.condition || 'NM') ? 'selected' : ''}>${k}</option>`).join('')}
+            </select>
+            <span class="text-gold text-sm font-display tabular">${qar(valueOf(c))}</span>
+          `}
           <button class="drop ml-auto text-xs text-muted px-2">Remove</button>
         </div>
       </div>`;
-    row.querySelector('.cond').onchange = e => { PENDING[i].condition = e.target.value; render(); };
+
+    const cond = row.querySelector('.cond');
+    if (cond) cond.onchange = e => { PENDING[i].condition = e.target.value; render(); };
+
+    const again = row.querySelector('.again');
+    if (again) again.onclick = async () => {
+      if (!c.canvas) { toast('No image kept for that one. Rescan it.', 'bad'); return; }
+      again.disabled = true;
+      again.textContent = 'Reading';
+      const fresh = await readOne(c.canvas);
+      PENDING[i] = fresh;
+      render();
+    };
+
     row.querySelector('.drop').onclick = () => { PENDING.splice(i, 1); render(); };
     v.appendChild(row);
   });
 
   const actions = el('div', 'flex gap-3 mt-6');
-  const save = el('button', 'flex-1 bg-maroon py-3 rounded font-display tracking-wide', 'Add to collection');
+  const label = bad.length && good.length
+    ? `Add ${good.length} identified`
+    : bad.length ? 'Nothing to add' : 'Add to collection';
+  const save = el('button', `flex-1 py-3 rounded font-display tracking-wide ${good.length ? 'bg-maroon' : 'bg-ink2 text-muted'}`, label);
   const cancel = el('button', 'px-5 py-3 rounded border border-muted/30 text-muted text-sm', 'Discard');
+
   save.onclick = async () => {
-    const rows = PENDING.map(c => ({
+    // An unidentified row would save as a nameless entry worth nothing and
+    // then sit in the collection forever, so only identified cards go in.
+    if (!good.length) { toast('None of these were identified.', 'bad'); return; }
+    const rows = good.map(c => ({
       kind: 'single',
       cardId: c.cardId, name: c.name, setName: c.setName, number: c.number,
       printedTotal: c.printedTotal, image: c.image, variant: c.variant,
@@ -1101,7 +1306,7 @@ function viewReview(v) {
       qty: 1, tradeQty: 0, addedAt: Date.now(), priceUpdated: Date.now()
     }));
     const { stacked } = await commitRows(rows);
-    toast(stacked ? `${rows.length} added, ${stacked} stacked` : `${rows.length} added`);
+    toast(`${rows.length} added${stacked ? `, ${stacked} stacked` : ''}${bad.length ? `, ${bad.length} skipped` : ''}`);
     PENDING = [];
     go('collection');
   };
@@ -1408,6 +1613,8 @@ function go(tab, push = true) {
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => go(b.dataset.tab));
 
 window.addEventListener('popstate', e => {
+  // A sheet is the shallowest thing on screen, so back closes it first.
+  if (SHEET) { SHEET = null; renderSheet(); return; }
   // Back out of a review discards the scan rather than the app. Restore the
   // entry the back press consumed first, before the confirm, so cancelling
   // leaves history intact and the next press still returns to Collection.
