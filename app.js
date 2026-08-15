@@ -189,18 +189,46 @@ async function identify(b64) {
 
 const PTCG = 'https://api.pokemontcg.io/v2/cards';
 
-/* Catalog data is static, so it caches for 30 days. Prices are not, so a
+/* pokemontcg.io's keyless tier throws intermittent 500s and 502s under
+   sequential load. Without retries a single transient failure leaves a row
+   permanently unmatched, because enrichImport swallows the error and moves on.
+   Retry 5xx, 429 and network faults; a 4xx is a bad query and will never
+   succeed, so fail fast on those. */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function fetchWithRetry(url, headers, attempts = 4) {
+  let last;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch(url, { headers });
+      if (r.ok) return r;
+      if (r.status >= 400 && r.status < 500 && r.status !== 429)
+        throw new Error('Card database returned ' + r.status);
+      last = new Error('Card database returned ' + r.status);
+    } catch (e) {
+      last = e;
+      if (/returned 4\d\d/.test(e.message) && !/429/.test(e.message)) throw e;
+    }
+    if (i < attempts - 1) await sleep(400 * Math.pow(3, i) + Math.random() * 300);
+  }
+  throw last;
+}
+
+/* Catalog data is static, so a hit caches for 30 days. An empty result caches
+   for one day only: it may mean the card genuinely is not indexed, but it may
+   also mean a set was added since, and a short window lets a later retry pick
+   it up without making every lookup expensive. Prices are not static, so a
    refresh passes fresh=true to skip the read and overwrite the entry. */
 async function ptcgQuery(q, fresh = false) {
   const key = 'q:' + q;
   if (!fresh) {
     const hit = await DB.cacheGet(key);
-    if (hit && Date.now() - hit.at < 30 * 864e5) return hit.value;
+    const ttl = (hit && hit.value && hit.value.length) ? 30 * 864e5 : 864e5;
+    if (hit && Date.now() - hit.at < ttl) return hit.value;
   }
 
   const headers = CFG.pokemonKey ? { 'X-Api-Key': CFG.pokemonKey } : {};
-  const r = await fetch(`${PTCG}?q=${encodeURIComponent(q)}&pageSize=12`, { headers });
-  if (!r.ok) throw new Error('Card database returned ' + r.status);
+  const r = await fetchWithRetry(`${PTCG}?q=${encodeURIComponent(q)}&pageSize=12`, headers);
   const out = (await r.json()).data || [];
   await DB.cacheSet(key, out);
   return out;
@@ -225,16 +253,20 @@ function bestHit(hits, name, setName) {
    printed total is close to a unique key, so try that first. Set name comes
    from an import row and is a strong tiebreak when the number is bare. */
 async function resolve(read) {
-  const raw = String(read.number || '').trim();
-  const num = /^\d+$/.test(raw) ? raw.replace(/^0+/, '') || '0' : raw;
+  const rawNum = String(read.number || '').trim();
+  const num = /^\d+$/.test(rawNum) ? rawNum.replace(/^0+/, '') || '0' : rawNum;
   const total = String(read.printedTotal || '').replace(/^0+/, '');
   const name = read.name || '';
   const set = read.setName || read.setHint || '';
+  // A promo code like SWSH260 or XY40 is distinctive enough to search on its
+  // own. A plain number like 25 is not: it would return hundreds of cards.
+  const codeLike = num && !/^\d+$/.test(num);
   let hits = [];
 
   if (num && total) hits = await ptcgQuery(`number:"${num}" set.printedTotal:${total}`);
   if (!hits.length && num && name) hits = await ptcgQuery(`number:"${num}" name:"${name}"`);
   if (!hits.length && num && set) hits = await ptcgQuery(`number:"${num}" set.name:"${set}"`);
+  if (!hits.length && codeLike) hits = await ptcgQuery(`number:"${num}"`);
   if (!hits.length && name && set) hits = await ptcgQuery(`name:"${name}" set.name:"${set}"`);
   if (!hits.length && name) hits = await ptcgQuery(`name:"${name}"`);
   if (!hits.length) return null;
@@ -517,7 +549,7 @@ function readCollectr(text) {
    through untouched, since the catalog holds no sealed product. */
 async function enrichImport(rows, onProgress) {
   const targets = rows.filter(r => r.kind === 'single');
-  let done = 0, matched = 0;
+  let done = 0, matched = 0, failed = 0;
   for (const r of targets) {
     try {
       const card = await resolve(r);
@@ -535,10 +567,15 @@ async function enrichImport(rows, onProgress) {
           if (p) { r.priceUsd = p.usd; r.printing = p.printing; r.priceUpdated = Date.now(); }
         }
       }
-    } catch { /* leave the Collectr figure in place rather than blanking it */ }
+    } catch {
+      // The lookup itself broke rather than coming back empty. Keep the
+      // Collectr figure and count it, so the finish message can tell the
+      // difference between "not in the catalog" and "try again".
+      failed++;
+    }
     onProgress(++done, targets.length);
   }
-  return matched;
+  return { matched, failed, total: targets.length };
 }
 
 /* Merge rows into the collection, stacking onto anything that matches. */
@@ -673,6 +710,19 @@ async function viewCollection(v) {
     </div>`;
   v.appendChild(controls);
 
+  const unmatched = cards.filter(c => c.kind !== 'sealed' && !c.cardId);
+  if (unmatched.length) {
+    const banner = el('div', 'border border-gold/50 rounded p-3 mt-3 flex items-center gap-3');
+    banner.innerHTML = `
+      <div class="flex-1 min-w-0">
+        <p class="text-[11px] uppercase tracking-[0.14em] text-gold">${unmatched.length} without a catalog match</p>
+        <p class="text-[11px] text-muted">No artwork and the price cannot auto-update.</p>
+      </div>
+      <button id="retry" class="shrink-0 text-xs uppercase tracking-[0.14em] text-gold border border-gold/40 px-3 py-1.5 rounded">Retry</button>`;
+    v.appendChild(banner);
+    $('#retry', banner).onclick = e => retryUnmatched(e.currentTarget, unmatched);
+  }
+
   const count = el('p', 'text-sm text-muted my-3');
   const list = el('div');
   v.append(count, list);
@@ -785,6 +835,36 @@ function listRow(c) {
   }
   q('.del').onclick = () => removeRow(c);
   return row;
+}
+
+/* Re-run the catalog lookup for rows that never resolved, so a run of
+   transient API failures does not mean clearing and importing all over again.
+   Passes fresh=true, because an empty result may already be cached. */
+async function retryUnmatched(btn, rows) {
+  btn.disabled = true;
+  let fixed = 0, n = 0;
+  for (const c of rows) {
+    btn.textContent = `${++n}/${rows.length}`;
+    try {
+      const card = await resolve({
+        name: c.name, number: c.number, printedTotal: c.printedTotal, setName: c.setName
+      });
+      if (!card) continue;
+      c.cardId = card.id;
+      c.image = card.images?.small || c.image;
+      c.rarity = card.rarity || c.rarity;
+      c.printedTotal = card.set?.printedTotal || c.printedTotal;
+      if (!c.grade) {
+        const p = priceOf(card, c.variant);
+        if (p) { c.priceUsd = p.usd; c.printing = p.printing; c.priceUpdated = Date.now(); }
+      }
+      await DB.put(c);
+      fixed++;
+    } catch { /* still down, leave it for the next attempt */ }
+  }
+  btn.disabled = false;
+  toast(fixed ? `${fixed} matched` : 'Still no match. Try again later.');
+  render();
 }
 
 async function refreshPrices(btn) {
@@ -1213,7 +1293,7 @@ function viewImport(v) {
     IMPORT.stage = 'running';
     IMPORT.total = raw.length;
     render();
-    const matched = await enrichImport(rows, (d, t) => {
+    const stats = await enrichImport(rows, (d, t) => {
       IMPORT.done = d; IMPORT.total = t;
       const bar = $('#view .bg-maroon[style]');
       const label = $('#view .text-gold.text-center');
@@ -1221,9 +1301,9 @@ function viewImport(v) {
       if (label) label.textContent = `Matching singles ${d} of ${t}`;
     });
     const { added, stacked } = await commitRows(rows);
-    const singles = rows.filter(r => r.kind === 'single').length;
     IMPORT = null;
-    toast(`${added} imported, ${stacked} stacked, ${matched}/${singles} matched to the catalog`);
+    toast(`${added} imported, ${stacked} stacked, ${stats.matched}/${stats.total} matched` +
+      (stats.failed ? `, ${stats.failed} lookup${stats.failed === 1 ? '' : 's'} failed` : ''));
     go('collection');
   };
   cancel.onclick = () => { IMPORT = null; render(); };
