@@ -562,6 +562,154 @@ async function processCrops(canvases, statusEl) {
   return results.filter(Boolean);
 }
 
+/* ---------------------------------------------------------- binder pages */
+
+/* Cards in binder pockets touch, so edge detection welds them into one shape
+   and the cropper finds nothing. Confirmed against real photos. The way
+   through is not geometry: read the whole page at once and ask what is on it.
+   Names come back reliably at page resolution. Collector numbers do not, so
+   the set has to be chosen by hand afterwards. */
+const BINDER_PROMPT = `This photo shows a page of a Pokemon card binder, with several cards in plastic pockets.
+List every card you can see, in reading order: left to right, top to bottom.
+Return ONLY a JSON array, no prose, no markdown fences:
+[{"name":"","number":"","setHint":"","variant":"normal","partial":false}]
+
+Rules:
+- "name" is the card name exactly as printed, including suffixes like ex, V, VMAX, VSTAR, GX. This is the most important field, take care with it.
+- "number" is the collector number at the bottom of the card if you can genuinely read it. If you cannot read it clearly, return "". Do not guess.
+- "setHint" is the set name or symbol if you can tell, otherwise "".
+- "variant" is "reverse" if the non-artwork part is foiled, "holo" if only the artwork is foiled, otherwise "normal".
+- "partial" is true if the card is cut off by the edge of the photo or mostly hidden.
+- Skip empty pockets entirely.
+If there are no cards at all, return [].`;
+
+async function readBinder(canvas) {
+  const parse = raw => {
+    const clean = String(raw).replace(/```json|```/g, '').trim();
+    const start = clean.indexOf('[');
+    const end = clean.lastIndexOf(']');
+    if (start < 0 || end < start) throw new Error('Scanner replied but not in the expected format.');
+    return JSON.parse(clean.slice(start, end + 1));
+  };
+
+  const ask = async cnv => {
+    const r = await fetch(CFG.workerUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-App-Secret': CFG.workerSecret },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1600,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: canvasToB64(cnv, 0.9) } },
+            { type: 'text', text: BINDER_PROMPT }
+          ]
+        }]
+      })
+    });
+    if (!r.ok) {
+      const detail = r.status === 401 ? 'Scanner rejected the shared secret (401). Check Settings.'
+        : r.status === 403 ? 'Scanner refused the request (403). Check ALLOWED_ORIGIN on the Worker.'
+        : `Scanner returned ${r.status}.`;
+      throw new Error(detail);
+    }
+    const data = await r.json();
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    return parse(text);
+  };
+
+  if (!CFG.workerUrl) throw new Error('No scanner endpoint set. Add the Worker URL in Settings.');
+  let list = await ask(canvas);
+  if (!list.length && canvas.width > canvas.height) list = await ask(rotateCanvas(canvas, 90));
+  return list;
+}
+
+/* Every printing of a name he might mean, newest first, so the set can be
+   picked from a list. A name alone can match hundreds of cards, so this asks
+   for more than the usual page and narrows by set hint when there is one. */
+async function candidatesFor(name, setHint) {
+  const seen = new Map();
+  const add = list => list.forEach(c => { if (!seen.has(c.id)) seen.set(c.id, c); });
+
+  const headers = CFG.pokemonKey ? { 'X-Api-Key': CFG.pokemonKey } : {};
+  const fetchQ = async q => {
+    const key = 'cand:' + q;
+    const hit = await DB.cacheGet(key);
+    if (hit && Date.now() - hit.at < 30 * 864e5) return hit.value;
+    const url = `${PTCG}?q=${encodeURIComponent(q)}&pageSize=60&orderBy=-set.releaseDate`;
+    const r = await fetchWithRetry(url, headers);
+    const out = (await r.json()).data || [];
+    await DB.cacheSet(key, out);
+    return out;
+  };
+
+  for (const n of nameVariants(name)) {
+    if (setHint) for (const st of setVariants(setHint)) {
+      try { add(await fetchQ(`name:"${n}" set.name:"${st}"`)); } catch {}
+    }
+    try { add(await fetchQ(`name:"${n}"`)); } catch {}
+    if (seen.size) break;
+  }
+  return [...seen.values()];
+}
+
+/* One review row per card on the page, each carrying its own set list. */
+async function processBinder(canvas, statusEl) {
+  statusEl.textContent = 'Reading the page';
+  const found = await readBinder(canvas);
+  if (!found.length) return [];
+
+  const rows = [];
+  let n = 0;
+  for (const read of found) {
+    statusEl.textContent = `Looking up ${++n} of ${found.length}`;
+    const name = String(read.name || '').trim();
+    if (!name) continue;
+    let candidates = [];
+    try { candidates = await candidatesFor(name, read.setHint); } catch {}
+
+    // If the number was legible the card resolves outright and no pick is
+    // needed. That is the exception on a page photo, not the rule.
+    let exact = null;
+    if (read.number) {
+      exact = candidates.find(c => String(c.number || '').replace(/^0+/, '') === String(read.number).replace(/^0+/, '')) || null;
+    }
+
+    rows.push({
+      kind: 'single',
+      fromBinder: true,
+      name,
+      readName: name,
+      variant: read.variant || 'normal',
+      partial: !!read.partial,
+      candidates,
+      cardId: null,
+      setName: '', number: '', printedTotal: '', rarity: '', image: '',
+      priceUsd: 0, priceSource: 'tcgplayer', matched: false,
+      condition: 'NM'
+    });
+    if (exact) applyCandidate(rows[rows.length - 1], exact);
+  }
+  return rows;
+}
+
+/* Fill a pending row from a chosen catalog card. */
+function applyCandidate(row, card) {
+  row.cardId = card.id;
+  row.name = card.name || row.name;
+  row.setName = card.set?.name || '';
+  row.number = card.number || '';
+  row.printedTotal = card.set?.printedTotal || '';
+  row.rarity = card.rarity || '';
+  row.image = card.images?.small || '';
+  const p = priceOf(card, row.variant);
+  row.priceUsd = p?.usd || 0;
+  row.printing = p?.printing || '';
+  row.matched = true;
+  return row;
+}
+
 /* ----------------------------------------------------------- csv import */
 
 /* Proper CSV reader: Collectr quotes any field containing a comma, and prices
@@ -835,6 +983,77 @@ function summaryCard(cards) {
 
   if (top) box.querySelector('.border-t')?.addEventListener('click', () => openSheet(top));
   return box;
+}
+
+/* ------------------------------------------------------- collectr export */
+
+/* Write the collection back out in Collectr's own column shape. Their import
+   support is undocumented, so this is a bet rather than a guarantee, but a
+   file in their exact format is the likeliest thing to be accepted, and it is
+   a lossless mirror of the collection either way. */
+const VARIANCE_OUT = { normal: 'Normal', holo: 'Holofoil', reverse: 'Reverse Holofoil', firstEd: '1st Edition' };
+const CONDITION_OUT = { NM: 'Near Mint', LP: 'Lightly Played', MP: 'Moderately Played', HP: 'Heavily Played', DMG: 'Damaged' };
+
+const csvCell = x => `"${String(x ?? '').replace(/"/g, '""')}"`;
+
+function toCollectrCsv(cards) {
+  const today = new Date().toISOString().slice(0, 10);
+  const head = ['Portfolio Name', 'Category', 'Set', 'Product Name', 'Card Number',
+    'Rarity', 'Variance', 'Grade', 'Card Condition', 'Average Cost Paid', 'Quantity',
+    `Market Price (As of ${today})`, 'Price Override', 'Watchlist', 'Date Added', 'Notes'];
+
+  const rows = cards.map(c => {
+    const sealed = c.kind === 'sealed';
+    // Collectr writes the era in Variance where there is one, and the foil
+    // type otherwise. Reverse that mapping on the way out.
+    const variance = sealed ? '' : (c.era || VARIANCE_OUT[c.variant] || 'Normal');
+    const number = sealed ? ''
+      : (c.number && c.printedTotal ? `${c.number}/${c.printedTotal}` : (c.number || ''));
+    return [
+      'Main',
+      'Pokemon',
+      c.setName || '',
+      c.name || '',
+      number,
+      c.rarity || '',
+      variance,
+      c.grade || 'Ungraded',
+      sealed ? '' : (CONDITION_OUT[c.condition] || 'Near Mint'),
+      (c.costUsd || 0).toFixed(2),
+      c.qty || 1,
+      (c.priceUsd || 0).toFixed(2),
+      '0',
+      'false',
+      new Date(c.addedAt || Date.now()).toISOString().slice(0, 10),
+      c.notes || ''
+    ].map(csvCell).join(',');
+  });
+
+  return [head.map(csvCell).join(','), ...rows].join('\n');
+}
+
+/* Everything this app knows, for a backup that can be read back in full. */
+function toFullCsv(cards) {
+  const head = ['kind', 'name', 'set', 'number', 'printedTotal', 'variant', 'era',
+                'rarity', 'grade', 'condition', 'qty', 'tradeQty', 'priceUsd', 'priceQar',
+                'priceSource', 'cardId', 'addedAt'];
+  const rows = cards.map(c => [
+    c.kind || 'single', c.name, c.setName, c.number, c.printedTotal, c.variant, c.era || '',
+    c.rarity || '', c.grade || '', c.condition || '', c.qty || 1, tradeOf(c),
+    (c.priceUsd || 0).toFixed(2), Math.round((c.priceUsd || 0) * CFG.qarRate),
+    c.priceSource || 'tcgplayer', c.cardId || '',
+    new Date(c.addedAt || Date.now()).toISOString().slice(0, 10)
+  ].map(csvCell).join(','));
+  return [head.map(csvCell).join(','), ...rows].join('\n');
+}
+
+function downloadCsv(text, name) {
+  const blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
+  const a = el('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 /* ----------------------------------------------------------------- views */
@@ -1306,6 +1525,17 @@ async function viewScan(v) {
         </div>
       </label>
 
+      <label class="block bg-ink2 border border-maroonD rounded p-5 mt-3 active:opacity-90">
+        <input type="file" accept="image/*" capture="environment" class="hidden" id="binder">
+        <div class="flex items-center gap-4">
+          <span class="text-3xl">\u2637</span>
+          <div>
+            <p class="font-display text-lg leading-tight">Binder page</p>
+            <p class="text-xs text-muted">A whole page without taking cards out. Pick the set for each.</p>
+          </div>
+        </div>
+      </label>
+
       <div class="serrate serrate-thin my-6"></div>
 
       <p class="text-xs uppercase tracking-[0.16em] text-muted mb-2">For bulk shots</p>
@@ -1319,40 +1549,48 @@ async function viewScan(v) {
       <p id="status" class="text-center text-sm text-gold mt-8"></p>
     </div>`;
 
-  $('#single').onchange = e => runScan(e.target.files[0], false);
-  $('#bulk').onchange = e => runScan(e.target.files[0], true);
+  $('#single').onchange = e => runScan(e.target.files[0], 'single');
+  $('#bulk').onchange = e => runScan(e.target.files[0], 'bulk');
+  $('#binder').onchange = e => runScan(e.target.files[0], 'binder');
 }
 
-async function runScan(file, isBulk) {
+async function runScan(file, mode) {
   if (!file) return;
   const status = $('#status');
   flash();
   try {
     status.textContent = 'Reading photo';
-    const canvas = await fileToCanvas(file, isBulk ? 2000 : 1400);
+    const canvas = await fileToCanvas(file, mode === 'single' ? 1400 : 2200);
 
-    let crops;
-    if (isBulk) {
+    let found;
+    if (mode === 'binder') {
+      found = await processBinder(canvas, status);
+      if (!found.length) {
+        status.textContent = '';
+        toast('No cards found on that page. Try filling the frame with it.', 'bad');
+        return;
+      }
+    } else if (mode === 'bulk') {
       status.textContent = 'Finding cards';
-      crops = await cropCards(canvas);
+      const crops = await cropCards(canvas);
       if (!crops.length) {
         status.textContent = '';
         toast('No cards found. Loose cards on a dark surface, with gaps.', 'bad');
         return;
       }
       status.textContent = `Found ${crops.length}`;
+      found = await processCrops(crops, status);
     } else {
-      crops = [canvas];
+      found = await processCrops([canvas], status);
     }
 
-    const found = await processCrops(crops, status);
-
-    // Tell him what he already owns while the card is still in his hand,
+    // Tell him what he already owns while the card is still in front of him,
     // rather than in a toast after saving.
     const owned = await DB.all();
     const byKey = new Map(owned.map(r => [stackKey(r), r]));
     found.forEach(c => {
-      const hit = c.cardId ? byKey.get(stackKey({ ...c, condition: c.condition || 'NM' })) : null;
+      const k = c.cardId ? stackKey({ ...c, condition: c.condition || 'NM' }) : null;
+      const hit = k ? byKey.get(k) : null;
       c.existingQty = hit ? (hit.qty || 1) : 0;
     });
 
@@ -1369,40 +1607,81 @@ async function runScan(file, isBulk) {
 
 function viewReview(v) {
   const good = PENDING.filter(c => c.matched);
-  const bad = PENDING.filter(c => !c.matched);
+  const needPick = PENDING.filter(c => c.fromBinder && !c.matched);
+  const bad = PENDING.filter(c => !c.matched && !c.fromBinder);
   const total = PENDING.reduce((s, c) => s + valueOf(c), 0);
 
   const head = el('div', 'mb-4 fade-up');
   head.innerHTML = `
     <p class="font-display text-xl">${PENDING.length} card${PENDING.length > 1 ? 's' : ''} read</p>
     <p class="text-gold font-display text-2xl tabular">${money(total)}</p>
-    <p class="text-xs text-muted">${alt(total)} at market.${bad.length ? ` ${bad.length} could not be identified.` : ' Check anything flagged before saving.'}</p>`;
+    <p class="text-xs text-muted">
+      ${needPick.length ? `${needPick.length} still need a set chosen.` : ''}
+      ${bad.length ? ` ${bad.length} could not be identified.` : ''}
+      ${!needPick.length && !bad.length ? 'Check anything flagged before saving.' : ''}</p>`;
   v.appendChild(head);
 
   PENDING.forEach((c, i) => {
+    const picking = c.fromBinder && Array.isArray(c.candidates);
     const low = c.matched && (c.confidence ?? 1) < 0.75;
-    const failed = !c.matched;
-    const row = el('div', `flex gap-3 bg-ink2 rounded p-3 mb-2.5 fade-up ${failed ? 'border border-maroon' : low ? 'border border-gold/50' : ''}`);
+    const failed = !c.matched && !picking;
+    const row = el('div', `flex gap-3 bg-ink2 rounded p-3 mb-2.5 fade-up ${
+      failed ? 'border border-maroon' : (!c.matched || low) ? 'border border-gold/50' : ''}`);
+
+    // A binder row is a name plus a set to choose. The name came off the photo
+    // and the set list came from the catalog, so the only judgement left is
+    // which printing he actually owns.
+    const pickUi = picking ? `
+      <select class="pick w-full bg-ink text-xs rounded px-2 py-1.5 border border-muted/30 mt-1.5">
+        <option value="">${c.candidates.length ? 'Choose the set' : 'No matches found'}</option>
+        ${c.candidates.map(k => `<option value="${esc(k.id)}"${c.cardId === k.id ? ' selected' : ''}>${
+          esc(k.set?.name || '?')} ${esc(k.number || '')}${k.set?.printedTotal ? '/' + esc(k.set.printedTotal) : ''}${
+          priceOf(k, c.variant) ? ' \u00b7 ' + money(priceOf(k, c.variant).usd) : ''}</option>`).join('')}
+      </select>
+      <select class="foil w-full bg-ink text-xs rounded px-2 py-1.5 border border-muted/30 mt-1.5">
+        ${[['normal', 'Normal'], ['holo', 'Holo'], ['reverse', 'Reverse holo']].map(([val, label]) =>
+          `<option value="${val}"${c.variant === val ? ' selected' : ''}>${label}</option>`).join('')}
+      </select>` : '';
+
     row.innerHTML = `
-      ${thumb(c, 'w-14 rounded card-ratio shrink-0 bg-ink')}
+      ${thumb(c, 'w-14 rounded card-ratio shrink-0 bg-ink3')}
       <div class="flex-1 min-w-0">
         <p class="font-display text-sm truncate">${esc(c.name)}</p>
-        ${failed ? '' : `<p class="text-[11px] text-muted truncate">${esc(c.setName)} ${esc(c.number)}${c.printedTotal ? '/' + esc(c.printedTotal) : ''} \u00b7 ${esc(c.printing || c.variant)}</p>`}
+        ${c.matched ? `<p class="text-[11px] text-muted truncate">${esc(c.setName)} ${esc(c.number)}${
+          c.printedTotal ? '/' + esc(c.printedTotal) : ''} \u00b7 ${esc(c.printing || c.variant)}</p>` : ''}
+        ${c.partial ? `<p class="text-[11px] text-gold">Cut off at the edge of the photo</p>` : ''}
         ${c.error ? `<p class="text-[11px] text-sand/80 mt-0.5 break-words">${esc(c.error)}</p>` : ''}
         ${low ? `<p class="text-[11px] text-gold mt-0.5">Low confidence, worth a look</p>` : ''}
         ${c.existingQty ? `<p class="text-[11px] text-sand/70 mt-0.5">Already have ${c.existingQty}</p>` : ''}
+        ${pickUi}
         <div class="flex items-center gap-2 mt-2">
-          ${failed ? `
-            <button class="again text-[11px] uppercase tracking-[0.12em] border border-gold/40 text-gold px-2 py-1 rounded">Try again</button>
-          ` : `
+          ${failed ? `<button class="again text-[11px] uppercase tracking-[0.12em] border border-gold/40 text-gold px-2 py-1 rounded">Try again</button>` : ''}
+          ${c.matched ? `
             <select class="cond bg-ink text-xs rounded px-2 py-1 border border-muted/30">
               ${CONDITIONS.map(k => `<option ${k === (c.condition || 'NM') ? 'selected' : ''}>${k}</option>`).join('')}
             </select>
-            <span class="text-gold text-sm font-display tabular">${money(valueOf(c))}</span>
-          `}
+            <span class="text-gold text-sm font-display tabular">${money(valueOf(c))}</span>` : ''}
           <button class="drop ml-auto text-xs text-muted px-2">Remove</button>
         </div>
       </div>`;
+
+    const pick = row.querySelector('.pick');
+    if (pick) pick.onchange = e => {
+      const card = c.candidates.find(k => k.id === e.target.value);
+      if (!card) { Object.assign(PENDING[i], { cardId: null, matched: false, image: '', priceUsd: 0, setName: '', number: '' }); }
+      else applyCandidate(PENDING[i], card);
+      render();
+    };
+
+    const foil = row.querySelector('.foil');
+    if (foil) foil.onchange = e => {
+      PENDING[i].variant = e.target.value;
+      // Repricing matters here: a reverse holo and a normal of the same card
+      // are different money.
+      const card = c.candidates.find(k => k.id === PENDING[i].cardId);
+      if (card) applyCandidate(PENDING[i], card);
+      render();
+    };
 
     const cond = row.querySelector('.cond');
     if (cond) cond.onchange = e => { PENDING[i].condition = e.target.value; render(); };
@@ -1412,8 +1691,7 @@ function viewReview(v) {
       if (!c.canvas) { toast('No image kept for that one. Rescan it.', 'bad'); return; }
       again.disabled = true;
       again.textContent = 'Reading';
-      const fresh = await readOne(c.canvas);
-      PENDING[i] = fresh;
+      PENDING[i] = await readOne(c.canvas);
       render();
     };
 
@@ -1422,16 +1700,14 @@ function viewReview(v) {
   });
 
   const actions = el('div', 'flex gap-3 mt-6');
-  const label = bad.length && good.length
-    ? `Add ${good.length} identified`
-    : bad.length ? 'Nothing to add' : 'Add to collection';
+  const skipped = PENDING.length - good.length;
+  const label = !good.length ? 'Nothing to add'
+    : skipped ? `Add ${good.length} of ${PENDING.length}` : 'Add to collection';
   const save = el('button', `flex-1 py-3 rounded font-display tracking-wide ${good.length ? 'bg-maroon' : 'bg-ink2 text-muted'}`, label);
   const cancel = el('button', 'px-5 py-3 rounded border border-muted/30 text-muted text-sm', 'Discard');
 
   save.onclick = async () => {
-    // An unidentified row would save as a nameless entry worth nothing and
-    // then sit in the collection forever, so only identified cards go in.
-    if (!good.length) { toast('None of these were identified.', 'bad'); return; }
+    if (!good.length) { toast('Nothing here is identified yet.', 'bad'); return; }
     const rows = good.map(c => ({
       kind: 'single',
       cardId: c.cardId, name: c.name, setName: c.setName, number: c.number,
@@ -1442,7 +1718,7 @@ function viewReview(v) {
       qty: 1, tradeQty: 0, addedAt: Date.now(), priceUpdated: Date.now()
     }));
     const { stacked } = await commitRows(rows);
-    toast(`${rows.length} added${stacked ? `, ${stacked} stacked` : ''}${bad.length ? `, ${bad.length} skipped` : ''}`);
+    toast(`${rows.length} added${stacked ? `, ${stacked} stacked` : ''}${skipped ? `, ${skipped} skipped` : ''}`);
     PENDING = [];
     go('collection');
   };
@@ -1548,6 +1824,9 @@ async function viewSettings(v) {
 
       <button id="s-export" class="w-full border border-maroonD py-3 rounded text-sm">Save a backup copy</button>
       <p class="text-[11px] text-muted -mt-3">Downloads everything as a spreadsheet. Worth doing now and then, since the collection lives only on this phone.</p>
+
+      <button id="s-collectr" class="w-full border border-maroonD py-3 rounded text-sm">Export for Collectr</button>
+      <p class="text-[11px] text-muted -mt-3">Same columns Collectr uses in its own export, so it is the best chance of importing cleanly there.</p>
 
       ${installPrompt ? `<button id="s-install" class="w-full border border-gold/50 text-gold py-3 rounded text-sm">Add to home screen</button>` : ''}
 
@@ -1658,21 +1937,14 @@ async function viewSettings(v) {
 
   $('#s-export').onclick = async () => {
     const cards = await DB.all();
-    const head = ['kind', 'name', 'set', 'number', 'printedTotal', 'variant', 'era',
-                  'grade', 'condition', 'qty', 'priceUsd', 'priceQar', 'priceSource', 'tradeQty'];
-    const rows = cards.map(c => [
-      c.kind || 'single', c.name, c.setName, c.number, c.printedTotal, c.variant, c.era || '',
-      c.grade || '', c.condition || '', c.qty || 1,
-      (c.priceUsd || 0).toFixed(2), Math.round((c.priceUsd || 0) * CFG.qarRate),
-      c.priceSource || 'tcgplayer', tradeOf(c)
-    ].map(x => `"${String(x ?? '').replace(/"/g, '""')}"`).join(','));
-    const blob = new Blob([[head.join(','), ...rows].join('\n')], { type: 'text/csv' });
-    const a = el('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `al-majmoua-${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    toast('Backup saved to downloads');
+    downloadCsv(toFullCsv(cards), `al-majmoua-backup-${new Date().toISOString().slice(0, 10)}.csv`);
+    toast(`Backup saved, ${cards.length} rows`);
+  };
+
+  $('#s-collectr').onclick = async () => {
+    const cards = await DB.all();
+    downloadCsv(toCollectrCsv(cards), `for-collectr-${new Date().toISOString().slice(0, 10)}.csv`);
+    toast(`${cards.length} rows written in Collectr format`);
   };
 }
 
